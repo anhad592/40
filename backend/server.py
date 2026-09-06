@@ -771,13 +771,12 @@ async def login(body: UserIn):
     if not user or not verify_password(body.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # ── Two-step verification (email OTP) — DISABLED ─────────────────────
+    # ── Two-step verification (email OTP) ────────────────────────────────
     # Optional email-OTP second step. Admin can turn this ON/OFF per user
     # from Admin → Users. When ON, the user must complete an email OTP as a
     # second step. The code is emailed to the same address configured for the
     # daily database backup, reusing those Gmail credentials.
-    # TEMPORARILY DISABLED: OTP login is turned off. Set to True to re-enable.
-    OTP_LOGIN_ENABLED = False
+    OTP_LOGIN_ENABLED = True
     if OTP_LOGIN_ENABLED and user.get("otp_login"):
         import random
         code = f"{random.randint(0, 999999):06d}"
@@ -7605,10 +7604,294 @@ async def ai_summary_dispatch(
         raise HTTPException(status_code=500, detail=f"Summary failed: {e}")
 
 
+# ======================== Transport Routes (map + optimizer) ================
+FACTORY_LOCATION = {
+    "lat": 30.8978257,
+    "lng": 75.8528076,
+    "label": "JK Products Factory",
+}
+
+
+class TransportStop(BaseModel):
+    # Legacy fields kept optional so existing saved routes still deserialize.
+    customer: Optional[str] = None
+    material: Optional[str] = None
+    destination: Optional[str] = None
+    # The new, simplified transport model — a named point on the map.
+    name: Optional[str] = None
+    transport_id: Optional[str] = None
+    lat: float
+    lng: float
+
+
+class TransportCreate(BaseModel):
+    name: str
+    lat: float
+    lng: float
+
+
+class TransportUpdate(BaseModel):
+    name: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+
+
+class TransportRouteCreate(BaseModel):
+    name: str
+    stops: List[TransportStop]
+    optimized_order: Optional[List[int]] = None  # indices into stops
+    total_distance_km: Optional[float] = None
+    total_duration_min: Optional[float] = None
+    geometry: Optional[str] = None  # encoded polyline from OSRM
+
+
+class GeocodeIn(BaseModel):
+    q: str
+
+
+class OptimizeIn(BaseModel):
+    stops: List[TransportStop]
+
+
+@api_router.get("/transport/factory")
+async def transport_factory(_user=Depends(get_current_user)):
+    return FACTORY_LOCATION
+
+
+# ── Transports master (name + coordinates) ────────────────────────────────
+@api_router.get("/transports")
+async def list_transports(_user=Depends(get_current_user)):
+    docs = await db.transports.find({}, {"_id": 0}).sort("name", 1).to_list(1000)
+    return docs
+
+
+@api_router.post("/transports")
+async def create_transport(body: TransportCreate, user=Depends(get_current_user)):
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not (-90 <= body.lat <= 90) or not (-180 <= body.lng <= 180):
+        raise HTTPException(status_code=400, detail="Coordinates are out of range")
+    existing = await db.transports.find_one({"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}})
+    if existing:
+        raise HTTPException(status_code=409, detail="A transport with this name already exists")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "lat": float(body.lat),
+        "lng": float(body.lng),
+        "created_at": now_iso(),
+        "created_by": user.get("email") or user.get("username") or user.get("id"),
+    }
+    await db.transports.insert_one(dict(doc))
+    return doc
+
+
+@api_router.patch("/transports/{tid}")
+async def update_transport(tid: str, body: TransportUpdate, _user=Depends(get_current_user)):
+    patch: Dict[str, Any] = {}
+    if body.name is not None:
+        nm = body.name.strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        clash = await db.transports.find_one({
+            "id": {"$ne": tid},
+            "name": {"$regex": f"^{re.escape(nm)}$", "$options": "i"},
+        })
+        if clash:
+            raise HTTPException(status_code=409, detail="Another transport already uses this name")
+        patch["name"] = nm
+    if body.lat is not None:
+        if not (-90 <= body.lat <= 90):
+            raise HTTPException(status_code=400, detail="Latitude is out of range")
+        patch["lat"] = float(body.lat)
+    if body.lng is not None:
+        if not (-180 <= body.lng <= 180):
+            raise HTTPException(status_code=400, detail="Longitude is out of range")
+        patch["lng"] = float(body.lng)
+    if not patch:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    res = await db.transports.update_one({"id": tid}, {"$set": patch})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Transport not found")
+    doc = await db.transports.find_one({"id": tid}, {"_id": 0})
+    return doc
+
+
+@api_router.delete("/transports/{tid}")
+async def delete_transport(tid: str, _user=Depends(require_admin)):
+    res = await db.transports.delete_one({"id": tid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Transport not found")
+    return {"ok": True}
+
+
+@api_router.post("/transport/geocode")
+async def transport_geocode(body: GeocodeIn, _user=Depends(get_current_user)):
+    """Free-text → best {lat,lng,display_name} via Nominatim (OpenStreetMap)."""
+    q = (body.q or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="Query is empty")
+    import httpx as _httpx
+    headers = {"User-Agent": "JKProducts-TransportPlanner/1.0"}
+    params = {"q": q, "format": "jsonv2", "limit": 5, "addressdetails": 0}
+    try:
+        async with _httpx.AsyncClient(timeout=15) as c:
+            r = await c.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers)
+            r.raise_for_status()
+            arr = r.json() or []
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Geocoding failed: {e}")
+    results = [
+        {"lat": float(x["lat"]), "lng": float(x["lon"]), "display_name": x.get("display_name", "")}
+        for x in arr
+    ]
+    return {"results": results}
+
+
+@api_router.post("/transport/optimize")
+async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
+    """Compute a good factory→stops route using the free OSRM public server.
+    Uses the /trip endpoint (roundtrip=false, source=first) — a TSP-ish
+    solver over real road distances. Falls back to a nearest-neighbour
+    haversine ordering if OSRM is unreachable so the UI keeps working.
+    """
+    stops = body.stops or []
+    if not stops:
+        raise HTTPException(status_code=400, detail="At least one stop is required")
+    factory = f"{FACTORY_LOCATION['lng']},{FACTORY_LOCATION['lat']}"
+    coord_list = [factory] + [f"{s.lng},{s.lat}" for s in stops]
+    coords = ";".join(coord_list)
+    url = f"https://router.project-osrm.org/trip/v1/driving/{coords}"
+    params = {"source": "first", "roundtrip": "false", "overview": "full", "geometries": "polyline"}
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+        if data.get("code") != "Ok" or not data.get("trips"):
+            raise RuntimeError(data.get("message") or "OSRM did not return a trip")
+        trip = data["trips"][0]
+        # waypoints[i].waypoint_index gives the visit order for input i
+        wps = data.get("waypoints") or []
+        # Skip index 0 which is the factory; return 0-based indices into `stops`.
+        order = [0] * (len(coord_list) - 1)
+        for i, wp in enumerate(wps):
+            if i == 0:
+                continue  # factory
+            visit_pos = int(wp.get("waypoint_index", i))  # 0..N
+            # visit_pos==0 means the factory; stop's actual visit rank is visit_pos
+            order[visit_pos - 1] = i - 1
+        return {
+            "ok": True,
+            "engine": "osrm",
+            "order": order,
+            "total_distance_km": round((trip.get("distance") or 0) / 1000.0, 2),
+            "total_duration_min": round((trip.get("duration") or 0) / 60.0, 1),
+            "geometry": trip.get("geometry", ""),
+        }
+    except Exception as e:
+        logger.warning("OSRM trip failed, using haversine fallback: %s", e)
+
+    # ── Fallback: nearest-neighbour over straight-line (haversine) distance ──
+    from math import radians, sin, cos, asin, sqrt
+    def hav(a, b):
+        lat1, lon1 = radians(a[0]), radians(a[1])
+        lat2, lon2 = radians(b[0]), radians(b[1])
+        dlat, dlon = lat2 - lat1, lon2 - lon1
+        h = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+        return 2 * 6371.0 * asin(sqrt(h))
+    pts = [(s.lat, s.lng) for s in stops]
+    remaining = list(range(len(pts)))
+    order: List[int] = []
+    cur = (FACTORY_LOCATION["lat"], FACTORY_LOCATION["lng"])
+    total = 0.0
+    while remaining:
+        nxt = min(remaining, key=lambda i: hav(cur, pts[i]))
+        total += hav(cur, pts[nxt])
+        order.append(nxt)
+        cur = pts[nxt]
+        remaining.remove(nxt)
+    return {
+        "ok": True,
+        "engine": "haversine",
+        "order": order,
+        "total_distance_km": round(total, 2),
+        "total_duration_min": None,
+        "geometry": "",
+    }
+
+
+@api_router.get("/transport/routes")
+async def list_transport_routes(_user=Depends(get_current_user)):
+    docs = await db.transport_routes.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    return docs
+
+
+@api_router.post("/transport/routes")
+async def create_transport_route(body: TransportRouteCreate, user=Depends(get_current_user)):
+    doc = body.model_dump()
+    doc["id"] = str(uuid.uuid4())
+    doc["created_at"] = now_iso()
+    doc["created_by"] = user.get("email") or user.get("username") or user.get("id")
+    await db.transport_routes.insert_one(dict(doc))
+    return doc
+
+
+@api_router.delete("/transport/routes/{rid}")
+async def delete_transport_route(rid: str, _user=Depends(require_admin)):
+    res = await db.transport_routes.delete_one({"id": rid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Route not found")
+    return {"ok": True}
+
+
+@api_router.get("/transport/bags-by-date")
+async def transport_bags_by_date(date: Optional[str] = None, _user=Depends(get_current_user)):
+    """Aggregate dispatches by transport_name for a given IST day and return
+    {transport_name -> total_bags, dispatches, customers} so the Transport
+    Routes sequence view can show how many bags are going via each transport.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    today_ist = datetime.now(IST).date()
+    if date:
+        try:
+            target = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+    else:
+        target = today_ist
+    start = datetime.combine(target, datetime.min.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
+    end = datetime.combine(target, datetime.max.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
+    docs = await db.dispatches.find(
+        {"dispatched_at": {"$gte": start, "$lte": end}},
+        {"_id": 0, "transport_name": 1, "bag_count": 1, "customer_name": 1, "customer_id": 1},
+    ).to_list(5000)
+    agg: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        nm = (d.get("transport_name") or "").strip()
+        if not nm:
+            continue
+        key = nm.lower()
+        entry = agg.get(key)
+        if entry is None:
+            entry = {
+                "transport_name": nm,
+                "total_bags": 0,
+                "dispatch_count": 0,
+                "customers": [],
+            }
+            agg[key] = entry
+        entry["total_bags"] += int(d.get("bag_count") or 0)
+        entry["dispatch_count"] += 1
+        cn = d.get("customer_name") or ""
+        if cn and cn not in entry["customers"]:
+            entry["customers"].append(cn)
+    return {"date": target.isoformat(), "by_transport": list(agg.values())}
+
+
 app.include_router(api_router)
-
-
-# ---- Kubernetes / deployment health probes ----
 # The platform's liveness/readiness probe calls `GET /health` at the ROOT
 # (no /api prefix). Without this route the probe gets a 404 and the pod is
 # marked unhealthy, which blocks the deployment from going live.

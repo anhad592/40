@@ -487,6 +487,21 @@ export default function TransportRoutes() {
 
   const geometry = useMemo(() => decodePolyline(result?.geometry || ""), [result?.geometry]);
 
+  // Switch the active route to one of the alternative options returned by
+  // the optimiser. Keeps the `options` list intact so the user can toggle
+  // freely between choices without re-fetching.
+  const selectRouteOption = (opt) => {
+    setResult((prev) => ({
+      ...(prev || {}),
+      engine: opt.engine,
+      order: opt.order,
+      total_distance_km: opt.total_distance_km,
+      total_duration_min: opt.total_duration_min,
+      geometry: opt.geometry,
+      _activeLabel: opt.label,
+    }));
+  };
+
   const mapPoints = useMemo(() => {
     if (selectedTransports.length > 0) return [factory, ...selectedTransports];
     if (transports.length > 0) return [factory, ...transports];
@@ -759,6 +774,39 @@ export default function TransportRoutes() {
                 </>
               ) : null}
             </div>
+            {/* Alternative route options — pick a different route */}
+            {result?.options && result.options.length > 1 && (
+              <div className="w-full flex flex-wrap items-center gap-1.5" data-testid="tr-route-options">
+                <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mr-0.5">
+                  Route options:
+                </span>
+                {result.options.map((opt, i) => {
+                  const activeLabel = result._activeLabel || result.options[0].label;
+                  const active = opt.label === activeLabel;
+                  return (
+                    <button
+                      key={`${opt.label}-${i}`}
+                      type="button"
+                      onClick={() => selectRouteOption(opt)}
+                      data-testid={`tr-route-option-${i}`}
+                      className={`inline-flex items-center gap-1.5 h-8 px-2.5 rounded-sm border text-[11px] font-bold transition-colors ${
+                        active
+                          ? "bg-[#E65100] text-white border-[#E65100]"
+                          : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                      }`}
+                    >
+                      <RouteIcon className="w-3.5 h-3.5" />
+                      <span>{opt.label}</span>
+                      {opt.total_distance_km != null && (
+                        <span className={`font-mono-num ${active ? "text-white/90" : "text-[#E65100]"}`}>
+                          {opt.total_distance_km} km
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
             <div className="flex-1 min-w-[160px]">
               <Input
                 value={routeName}

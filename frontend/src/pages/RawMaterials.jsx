@@ -7,7 +7,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogD
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 
-const empty = { name: "", unit: "kg", default_rate: "0", notes: "" };
+const empty = { name: "", unit: "kg", default_rate: "0", notes: "", min_stock: "0" };
 
 const KIND_LABEL = {
   purchase: "Purchase",
@@ -74,6 +74,7 @@ export default function RawMaterials() {
       unit: r.unit || "pcs",
       default_rate: String(r.default_rate ?? "0"),
       notes: r.notes || "",
+      min_stock: String(r.min_stock ?? "0"),
     });
     setOpen(true);
   };
@@ -81,7 +82,7 @@ export default function RawMaterials() {
     if (!form.name.trim()) { toast.error("Name required"); return; }
     setSaving(true);
     try {
-      const body = { ...form, default_rate: Number(form.default_rate || 0) };
+      const body = { ...form, default_rate: Number(form.default_rate || 0), min_stock: Number(form.min_stock || 0) };
       if (editingId) await api.patch(`/raw-materials/${editingId}`, body);
       else await api.post("/raw-materials", body);
       toast.success(editingId ? "Raw material updated" : "Raw material added");
@@ -167,21 +168,23 @@ export default function RawMaterials() {
               <th className="text-left px-4 py-2">Name</th>
               <th className="text-left px-4 py-2">Unit</th>
               <th className="text-right px-4 py-2">Stock on hand</th>
+              <th className="text-right px-4 py-2">Min stock</th>
               <th className="text-right px-4 py-2">Default rate (₹/unit)</th>
               <th className="text-left px-4 py-2">Notes</th>
               <th className="text-right px-4 py-2">Actions</th>
             </tr>
           </thead>
           <tbody>
-            {loading && <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-500">Loading…</td></tr>}
+            {loading && <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-500">Loading…</td></tr>}
             {!loading && filtered.length === 0 && (
-              <tr><td colSpan={6} className="px-4 py-6 text-center text-slate-500" data-testid="raw-materials-empty">
+              <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-500" data-testid="raw-materials-empty">
                 {rows.length === 0 ? "No raw materials yet. Click Add to create your first entry." : "No items match your search."}
               </td></tr>
             )}
             {!loading && filtered.map((r) => {
               const stock = Number(r.stock_on_hand || 0);
-              const low = stock <= 0;
+              const minStock = Number(r.min_stock || 0);
+              const low = minStock > 0 ? stock < minStock : stock <= 0;
               return (
               <tr key={r.id} className="border-t border-slate-100 hover:bg-orange-50/30" data-testid={`raw-row-${r.id}`}>
                 <td className="px-4 py-2 font-bold text-slate-900 inline-flex items-center gap-2">
@@ -191,6 +194,12 @@ export default function RawMaterials() {
                 <td className={`px-4 py-2 text-right tabular-nums font-bold ${low ? "text-rose-600" : "text-emerald-700"}`}
                     data-testid={`raw-stock-${r.id}`}>
                   {fmtQty(stock)}
+                  {low && minStock > 0 && (
+                    <span className="ml-1.5 inline-block text-[9px] uppercase tracking-wider font-bold text-rose-600 bg-rose-50 border border-rose-200 rounded-sm px-1 py-0.5 align-middle">Low</span>
+                  )}
+                </td>
+                <td className="px-4 py-2 text-right tabular-nums text-slate-600" data-testid={`raw-min-${r.id}`}>
+                  {minStock > 0 ? fmtQty(minStock) : "—"}
                 </td>
                 <td className="px-4 py-2 text-right tabular-nums">{Number(r.default_rate || 0) > 0 ? `₹${Number(r.default_rate).toLocaleString("en-IN")}` : "—"}</td>
                 <td className="px-4 py-2 text-slate-500 max-w-xs truncate">{r.notes || "—"}</td>
@@ -252,6 +261,17 @@ export default function RawMaterials() {
                        data-testid="raw-rate-input"
                        className="h-11 rounded-sm mt-1 tabular-nums" />
               </div>
+            </div>
+            <div>
+              <Label className="text-xs font-bold uppercase">Minimum stock (low-stock alert)</Label>
+              <Input type="number" min="0" step="0.01" value={form.min_stock}
+                     onChange={(e) => setForm((f) => ({ ...f, min_stock: e.target.value }))}
+                     placeholder="0"
+                     data-testid="raw-min-stock-input"
+                     className="h-11 rounded-sm mt-1 tabular-nums" />
+              <p className="text-[11px] text-slate-500 mt-1">
+                When stock falls below this, a daily low-stock alert appears in the notification bar. Set 0 to disable.
+              </p>
             </div>
             <div>
               <Label className="text-xs font-bold uppercase">Notes</Label>

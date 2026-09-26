@@ -212,10 +212,10 @@ export default function Dashboard() {
                         </span>
                       )}
                       <div className="min-w-0">
-                        <div className="font-semibold text-slate-900 text-sm truncate">
+                        <div className="font-semibold text-slate-900 text-sm break-words">
                           {p.item_name || p.product_name}
                         </div>
-                        <div className="text-[11px] text-slate-400 truncate">
+                        <div className="text-[11px] text-slate-400 break-words">
                           {p.product_name && p.item_name && p.product_name !== p.item_name && (
                             <span>{p.product_name} · </span>
                           )}

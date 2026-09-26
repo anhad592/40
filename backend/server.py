@@ -359,6 +359,7 @@ ALL_GRANTABLE_KEYS: List[str] = ALL_PERMISSION_KEYS + ACTION_PERMISSION_KEYS
 class SettingsUpdate(BaseModel):
     overdue_days: Optional[int] = None
     edit_window_days: Optional[int] = None
+    discrepancy_window_days: Optional[int] = None
 
 
 class ItemCreate(BaseModel):
@@ -673,13 +674,18 @@ async def seed_db():
         logger.info("Bill-number migration: converted %s numeric private marks", _num_migrated.modified_count)
     # Settings singleton — overdue order threshold (admin-configurable)
     if await db.settings.count_documents({"id": "global"}) == 0:
-        await db.settings.insert_one({"id": "global", "overdue_days": 15, "edit_window_days": 3, "updated_at": now_iso()})
+        await db.settings.insert_one({"id": "global", "overdue_days": 15, "edit_window_days": 3, "discrepancy_window_days": 2, "updated_at": now_iso()})
         logger.info("Seeded default settings (overdue_days=15, edit_window_days=3)")
     else:
         # Back-fill the new edit_window_days field on existing installs
         await db.settings.update_one(
             {"id": "global", "edit_window_days": {"$exists": False}},
             {"$set": {"edit_window_days": 3}},
+        )
+        # Back-fill the discrepancy detection window on existing installs
+        await db.settings.update_one(
+            {"id": "global", "discrepancy_window_days": {"$exists": False}},
+            {"$set": {"discrepancy_window_days": 2}},
         )
     # Products — additive: insert any from DEFAULT_PRODUCTS that don't exist yet
     existing_names = {p["name"] for p in await db.products.find({}, {"_id": 0, "name": 1}).to_list(1000)}
@@ -776,7 +782,7 @@ async def login(body: UserIn):
     # from Admin → Users. When ON, the user must complete an email OTP as a
     # second step. The code is emailed to the same address configured for the
     # daily database backup, reusing those Gmail credentials.
-    OTP_LOGIN_ENABLED = False
+    OTP_LOGIN_ENABLED = True
     if OTP_LOGIN_ENABLED and user.get("otp_login"):
         import random
         code = f"{random.randint(0, 999999):06d}"
@@ -1014,11 +1020,13 @@ async def permission_audit_all(limit: int = 100, admin=Depends(require_admin)):
 async def _get_settings_doc() -> Dict[str, Any]:
     doc = await db.settings.find_one({"id": "global"}, {"_id": 0})
     if not doc:
-        doc = {"id": "global", "overdue_days": 15, "edit_window_days": 3}
+        doc = {"id": "global", "overdue_days": 15, "edit_window_days": 3, "discrepancy_window_days": 2}
         await db.settings.insert_one({**doc, "updated_at": now_iso()})
     # Back-fill defaults for older docs.
     if "edit_window_days" not in doc:
         doc["edit_window_days"] = 3
+    if "discrepancy_window_days" not in doc:
+        doc["discrepancy_window_days"] = 2
     return doc
 
 
@@ -1039,6 +1047,13 @@ async def update_settings(body: SettingsUpdate, admin=Depends(require_admin)):
         if body.edit_window_days < 0 or body.edit_window_days > 365:
             raise HTTPException(status_code=400, detail="edit_window_days must be between 0 and 365")
         upd["edit_window_days"] = int(body.edit_window_days)
+    if body.discrepancy_window_days is not None:
+        # How many days BEFORE an order was entered a dispatch may fall and
+        # still be flagged as a timing discrepancy. Older dispatches are
+        # ignored. 0 = only same-day dispatches are flagged.
+        if body.discrepancy_window_days < 0 or body.discrepancy_window_days > 365:
+            raise HTTPException(status_code=400, detail="discrepancy_window_days must be between 0 and 365")
+        upd["discrepancy_window_days"] = int(body.discrepancy_window_days)
     if len(upd) == 1:
         # Only updated_at present — nothing to update.
         return await _get_settings_doc()
@@ -1048,6 +1063,219 @@ async def update_settings(body: SettingsUpdate, admin=Depends(require_admin)):
         upsert=True,
     )
     return await _get_settings_doc()
+
+
+# ======================== Notifications ========================
+# Live-computed alert feed with a persistent history. Two alert families:
+#   1) "pending_dispatch" — an order is punched, still Pending, AND at
+#      least one of its items is in stock (every raw material in the item's
+#      BOM covers the ordered qty — stock is fed in the Raw Materials tab).
+#      Re-raised DAILY until the order clears.
+#   2) "low_stock" — a raw material / vendor item whose stock_on_hand has
+#      fallen below its admin-set min_stock. Re-raised DAILY while low.
+# Each computed alert is upserted into the `notifications` collection with a
+# stable dedupe key (type:entity:date) so the same day never duplicates but
+# the history is preserved and read/unread state survives.
+
+def _today_bucket() -> str:
+    """IST day bucket (YYYY-MM-DD). Notifications recur once per IST day."""
+    ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    return ist.date().isoformat()
+
+
+class NotificationMarkReadIn(BaseModel):
+    ids: Optional[List[str]] = None   # specific notification ids
+    all: bool = False                 # mark everything read
+
+
+class NotificationClearIn(BaseModel):
+    """Dismiss (hide) notifications. Cleared docs stay in the DB with their
+    dedupe_key, so the daily recomputation will NOT resurrect them the same
+    day — a fresh alert only reappears on the next IST day if the condition
+    still holds."""
+    ids: Optional[List[str]] = None
+    all: bool = False
+
+
+_ACTIVE_FILTER = {"cleared": {"$ne": True}}
+
+
+async def _compute_and_store_notifications(user: Dict[str, Any]) -> None:
+    """Compute today's alerts and upsert them into the notifications
+    collection (idempotent per IST day via dedupe_key)."""
+    if is_blank_view(user):
+        return
+    bucket = _today_bucket()
+    ts = now_iso()
+
+    # ---- 1) Pending dispatch reminders (one per still-Pending order) ----
+    pending = await db.orders.find(
+        {"status": "Pending"}, {"_id": 0, "id": 1, "customer_id": 1, "items": 1, "created_at": 1, "order_date": 1}
+    ).to_list(3000)
+    cust_ids = list({o.get("customer_id") for o in pending if o.get("customer_id")})
+    cust_names: Dict[str, str] = {}
+    if cust_ids:
+        async for c in db.customers.find({"id": {"$in": cust_ids}}, {"_id": 0, "id": 1, "name": 1}):
+            cust_names[c["id"]] = c.get("name", "")
+
+    # Stock is fed in the Raw Materials tab. An order line counts as
+    # "in stock" only when every raw material in that SKU's BOM has enough
+    # stock_on_hand to cover the ordered qty. SKUs without a BOM (or with
+    # insufficient stock) are treated as NOT fed → no notification.
+    all_item_ids = list({
+        it.get("item_id")
+        for o in pending for it in (o.get("items") or [])
+        if it.get("item_id")
+    })
+    item_docs: Dict[str, Dict[str, Any]] = {}
+    if all_item_ids:
+        async for it in db.items.find(
+            {"id": {"$in": all_item_ids}}, {"_id": 0, "id": 1, "name": 1, "bom": 1}
+        ):
+            item_docs[it["id"]] = it
+    rm_stock: Dict[str, float] = {}
+    async for rm in db.raw_materials.find({}, {"_id": 0, "id": 1, "stock_on_hand": 1}):
+        rm_stock[rm["id"]] = float(rm.get("stock_on_hand") or 0)
+
+    to_upsert: List[Dict[str, Any]] = []
+    for o in pending:
+        lines = o.get("items") or []
+        if not lines:
+            continue
+        ready: List[str] = []
+        for it in lines:
+            doc = item_docs.get(it.get("item_id"))
+            bom = (doc or {}).get("bom") or []
+            if not bom:
+                continue  # stock never fed / no recipe → skip
+            try:
+                qty = int(float(str(it.get("quantity") or 0).replace(",", "").strip() or 0))
+            except (TypeError, ValueError):
+                qty = 0
+            if qty <= 0:
+                continue
+            can_make = True
+            for comp in bom:
+                need = float(comp.get("qty_per_unit") or 0) * qty
+                if need > 0 and rm_stock.get(comp.get("raw_material_id"), 0.0) < need:
+                    can_make = False
+                    break
+            if can_make:
+                name = it.get("item_name") or (doc or {}).get("name") or "Item"
+                ready.append(f"{name} ×{qty}")
+        # Notify only when at least one ordered item is in stock.
+        if not ready:
+            continue
+        party = cust_names.get(o.get("customer_id") or "", "Unknown party")
+        shown = ", ".join(ready[:3]) + (f" +{len(ready) - 3} more" if len(ready) > 3 else "")
+        dedupe = f"pending_dispatch:{o['id']}:{bucket}"
+        to_upsert.append({
+            "dedupe_key": dedupe,
+            "type": "pending_dispatch",
+            "severity": "warning",
+            "entity_id": o["id"],
+            "title": f"Ready to dispatch — {party}",
+            "message": f"In stock: {shown}. Reminder repeats daily until dispatched.",
+            "date_bucket": bucket,
+        })
+
+    # ---- 2) Low-stock alerts (raw materials / vendor items) ----
+    async for rm in db.raw_materials.find(
+        {"min_stock": {"$gt": 0}},
+        {"_id": 0, "id": 1, "name": 1, "unit": 1, "stock_on_hand": 1, "min_stock": 1},
+    ):
+        stock = float(rm.get("stock_on_hand") or 0)
+        mn = float(rm.get("min_stock") or 0)
+        if mn > 0 and stock < mn:
+            unit = rm.get("unit") or "pcs"
+            dedupe = f"low_stock:{rm['id']}:{bucket}"
+            to_upsert.append({
+                "dedupe_key": dedupe,
+                "type": "low_stock",
+                "severity": "critical",
+                "entity_id": rm["id"],
+                "title": f"Low stock — {rm.get('name', '')}",
+                "message": f"Only {stock:g} {unit} left (minimum {mn:g} {unit}). Please reorder.",
+                "date_bucket": bucket,
+            })
+
+    for n in to_upsert:
+        await db.notifications.update_one(
+            {"dedupe_key": n["dedupe_key"]},
+            {
+                "$setOnInsert": {
+                    "id": str(uuid.uuid4()),
+                    "created_at": ts,
+                    "read": False,
+                    "dedupe_key": n["dedupe_key"],
+                    "type": n["type"],
+                    "entity_id": n["entity_id"],
+                    "date_bucket": n["date_bucket"],
+                },
+                # Keep title/message fresh (stock number may change same day).
+                "$set": {"title": n["title"], "message": n["message"], "severity": n["severity"]},
+            },
+            upsert=True,
+        )
+
+
+@api_router.get("/notifications")
+async def list_notifications(limit: int = 100, user=Depends(get_current_user)):
+    """Return the notification feed (newest first) with the unread count.
+    Recomputes today's live alerts on every call so the feed is current."""
+    if is_blank_view(user):
+        return {"unread_count": 0, "items": []}
+    await _compute_and_store_notifications(user)
+    if limit <= 0 or limit > 500:
+        limit = 100
+    items = await db.notifications.find(_ACTIVE_FILTER, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
+    return {"unread_count": unread, "items": items}
+
+
+@api_router.get("/notifications/unread-count")
+async def notifications_unread_count(user=Depends(get_current_user)):
+    """Lightweight badge poll — recompute alerts then return unread count."""
+    if is_blank_view(user):
+        return {"unread_count": 0}
+    await _compute_and_store_notifications(user)
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
+    return {"unread_count": unread}
+
+
+@api_router.post("/notifications/mark-read")
+async def notifications_mark_read(body: NotificationMarkReadIn, user=Depends(get_current_user)):
+    ts = now_iso()
+    if body.all:
+        res = await db.notifications.update_many(
+            {"read": False, **_ACTIVE_FILTER}, {"$set": {"read": True, "read_at": ts}}
+        )
+    elif body.ids:
+        res = await db.notifications.update_many(
+            {"id": {"$in": body.ids}}, {"$set": {"read": True, "read_at": ts}}
+        )
+    else:
+        raise HTTPException(status_code=400, detail="Provide `ids` or set `all` true")
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
+    return {"ok": True, "modified": res.modified_count, "unread_count": unread}
+
+
+@api_router.post("/notifications/clear")
+async def notifications_clear(body: NotificationClearIn, user=Depends(get_current_user)):
+    """Dismiss one or more notifications. Cleared alerts are hidden from the
+    feed and badge but kept in the DB (history) — and because the dedupe_key
+    still exists, today's recomputation won't bring them back."""
+    ts = now_iso()
+    patch = {"cleared": True, "read": True, "read_at": ts, "cleared_at": ts}
+    if body.all:
+        res = await db.notifications.update_many(_ACTIVE_FILTER, {"$set": patch})
+    elif body.ids:
+        res = await db.notifications.update_many({"id": {"$in": body.ids}}, {"$set": patch})
+    else:
+        raise HTTPException(status_code=400, detail="Provide `ids` or set `all` true")
+    unread = await db.notifications.count_documents({"read": False, **_ACTIVE_FILTER})
+    return {"ok": True, "modified": res.modified_count, "unread_count": unread}
+
 
 
 # ======================== Backup & Restore ========================
@@ -1779,6 +2007,9 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
     # Annotate overdue flag + days_open for Pending orders, using admin-set threshold
     settings = await _get_settings_doc()
     threshold = int(settings.get("overdue_days", 15))
+    # Timing-discrepancy look-back window (admin-configurable): only flag a
+    # dispatch that happened at most this many days BEFORE the order entry.
+    disc_window = int(settings.get("discrepancy_window_days", 2))
     now = datetime.now(timezone.utc)
 
     # Customer location cache — the dispatch UI shows the party's city /
@@ -1968,6 +2199,11 @@ async def list_orders(status_filter: Optional[str] = None, user=Depends(get_curr
                     continue
                 # Core signal: goods shipped BEFORE this order was entered.
                 if not (disp_dt < entered):
+                    continue
+                # Days limit: only flag when the dispatch falls within the
+                # admin-configured window before the order entry. Dispatches
+                # older than that are treated as unrelated history.
+                if (entered - disp_dt) > timedelta(days=disc_window):
                     continue
                 # Require at least one shared SKU.
                 matched = []
@@ -3885,9 +4121,11 @@ async def import_price_list(plid: str, file: UploadFile = File(...), admin=Depen
 
 # ======================== Daily Dispatch Report ========================
 @api_router.get("/reports/daily-dispatch")
-async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_current_user)):
+async def daily_dispatch_report(date: Optional[str] = None, end_date: Optional[str] = None, user=Depends(get_current_user)):
     """Consolidated end-of-day report grouped by party (customer).
-    `date` is YYYY-MM-DD; defaults to today's IST date.
+    `date` is YYYY-MM-DD; defaults to today's IST date. When `end_date`
+    (YYYY-MM-DD, on/after `date`) is supplied, the report spans the full
+    date RANGE (inclusive, IST day boundaries) instead of a single day.
 
     Day boundaries use India Standard Time (UTC+5:30) so the report's
     grouping matches the factory's actual working day — same convention
@@ -3904,6 +4142,16 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
             raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
     else:
         target = today_ist
+    # Optional range end — inclusive, validated against the start date.
+    if end_date:
+        try:
+            end_target = datetime.strptime(end_date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="end_date must be YYYY-MM-DD")
+        if end_target < target:
+            raise HTTPException(status_code=400, detail="end_date must be on or after date")
+    else:
+        end_target = target
     # Edit-window metadata so the UI can lock/unlock the edit controls.
     settings = await _get_settings_doc()
     edit_window_days = int(settings.get("edit_window_days", 3) or 0)
@@ -3911,6 +4159,7 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
     if is_blank_view(user):
         return {
             "date": target.isoformat(),
+            "end_date": end_target.isoformat(),
             "groups": [],
             "grand_total_pcs": 0,
             "grand_total_value": 0,
@@ -3936,9 +4185,10 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
         except Exception:
             return False
     # IST day window expressed in UTC for the ISO-string compare against
-    # `dispatched_at` (which is stored in UTC).
+    # `dispatched_at` (which is stored in UTC). Range mode: the window runs
+    # from the START of the first day to the END of the last day (IST).
     start = datetime.combine(target, datetime.min.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
-    end = datetime.combine(target, datetime.max.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
+    end = datetime.combine(end_target, datetime.max.time(), tzinfo=IST).astimezone(timezone.utc).isoformat()
     dispatches = await db.dispatches.find(
         {"dispatched_at": {"$gte": start, "$lte": end}},
         {"_id": 0},
@@ -4110,6 +4360,7 @@ async def daily_dispatch_report(date: Optional[str] = None, user=Depends(get_cur
     out_groups = sorted(groups.values(), key=lambda g: g["customer_name"].lower())
     return {
         "date": target.isoformat(),
+        "end_date": end_target.isoformat(),
         "groups": out_groups,
         "grand_total_pcs": grand_pcs,
         "grand_total_value": round(grand_value, 2),
@@ -5721,6 +5972,7 @@ class RawMaterialIn(BaseModel):
     unit: Optional[str] = "pcs"          # kg / pcs / litre / m / etc.
     default_rate: float = 0.0            # informational default for purchases
     notes: Optional[str] = ""
+    min_stock: float = 0.0               # low-stock alert threshold (0 = no alert)
 
 
 class RawMaterialUpdate(BaseModel):
@@ -5728,6 +5980,7 @@ class RawMaterialUpdate(BaseModel):
     unit: Optional[str] = None
     default_rate: Optional[float] = None
     notes: Optional[str] = None
+    min_stock: Optional[float] = None
 
 
 @api_router.get("/raw-materials")
@@ -5748,6 +6001,7 @@ async def create_raw_material(body: RawMaterialIn, admin=Depends(require_admin))
         "default_rate": round(float(body.default_rate or 0), 2),
         "notes": (body.notes or "").strip(),
         "stock_on_hand": 0.0,
+        "min_stock": round(float(body.min_stock or 0), 2),
         "created_at": now_iso(),
         "created_by": admin["email"],
     }
@@ -5767,6 +6021,10 @@ async def update_raw_material(rid: str, body: RawMaterialUpdate, admin=Depends(r
         upd["default_rate"] = round(float(body.default_rate), 2)
     if body.notes is not None:
         upd["notes"] = body.notes.strip()
+    if body.min_stock is not None:
+        if body.min_stock < 0:
+            raise HTTPException(status_code=400, detail="min_stock cannot be negative")
+        upd["min_stock"] = round(float(body.min_stock), 2)
     res = await db.raw_materials.update_one({"id": rid}, {"$set": upd})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Raw material not found")
@@ -7751,75 +8009,158 @@ async def transport_geocode(body: GeocodeIn, _user=Depends(get_current_user)):
 
 @api_router.post("/transport/optimize")
 async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
-    """Compute a good factory→stops route using the free OSRM public server.
-    Uses the /trip endpoint (roundtrip=false, source=first) — a TSP-ish
-    solver over real road distances. Falls back to a nearest-neighbour
-    haversine ordering if OSRM is unreachable so the UI keeps working.
+    """Compute MULTIPLE candidate factory→stops routes so the operator can
+    choose. Returns an `options` list (each with its own order / distance /
+    duration / geometry) plus the best one flattened at the top level for
+    backwards compatibility.
+
+    Candidates generated:
+      1. "Shortest (optimized)" — OSRM /trip TSP solver over real roads.
+      2. "Nearest first"        — greedy nearest-neighbour (haversine) order,
+                                   drawn on real roads via OSRM /route.
+      3. "As selected"          — the exact order the operator picked, drawn
+                                   on real roads via OSRM /route.
+    Identical orderings are de-duplicated. If OSRM is unreachable we fall
+    back to straight-line geometry so the UI still works.
     """
     stops = body.stops or []
     if not stops:
         raise HTTPException(status_code=400, detail="At least one stop is required")
-    factory = f"{FACTORY_LOCATION['lng']},{FACTORY_LOCATION['lat']}"
-    coord_list = [factory] + [f"{s.lng},{s.lat}" for s in stops]
-    coords = ";".join(coord_list)
-    url = f"https://router.project-osrm.org/trip/v1/driving/{coords}"
-    params = {"source": "first", "roundtrip": "false", "overview": "full", "geometries": "polyline"}
-    import httpx as _httpx
-    try:
-        async with _httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()
-        if data.get("code") != "Ok" or not data.get("trips"):
-            raise RuntimeError(data.get("message") or "OSRM did not return a trip")
-        trip = data["trips"][0]
-        # waypoints[i].waypoint_index gives the visit order for input i
-        wps = data.get("waypoints") or []
-        # Skip index 0 which is the factory; return 0-based indices into `stops`.
-        order = [0] * (len(coord_list) - 1)
-        for i, wp in enumerate(wps):
-            if i == 0:
-                continue  # factory
-            visit_pos = int(wp.get("waypoint_index", i))  # 0..N
-            # visit_pos==0 means the factory; stop's actual visit rank is visit_pos
-            order[visit_pos - 1] = i - 1
-        return {
-            "ok": True,
-            "engine": "osrm",
-            "order": order,
-            "total_distance_km": round((trip.get("distance") or 0) / 1000.0, 2),
-            "total_duration_min": round((trip.get("duration") or 0) / 60.0, 1),
-            "geometry": trip.get("geometry", ""),
-        }
-    except Exception as e:
-        logger.warning("OSRM trip failed, using haversine fallback: %s", e)
 
-    # ── Fallback: nearest-neighbour over straight-line (haversine) distance ──
+    import httpx as _httpx
     from math import radians, sin, cos, asin, sqrt
+
+    factory_ll = (FACTORY_LOCATION["lat"], FACTORY_LOCATION["lng"])
+    pts = [(s.lat, s.lng) for s in stops]
+
     def hav(a, b):
         lat1, lon1 = radians(a[0]), radians(a[1])
         lat2, lon2 = radians(b[0]), radians(b[1])
         dlat, dlon = lat2 - lat1, lon2 - lon1
         h = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
         return 2 * 6371.0 * asin(sqrt(h))
-    pts = [(s.lat, s.lng) for s in stops]
+
+    def _coords_for_order(order: List[int]) -> str:
+        parts = [f"{FACTORY_LOCATION['lng']},{FACTORY_LOCATION['lat']}"]
+        parts += [f"{stops[i].lng},{stops[i].lat}" for i in order]
+        return ";".join(parts)
+
+    async def _osrm_route(client, order: List[int]):
+        """Real-road distance/duration/geometry for a FIXED visit order."""
+        url = f"https://router.project-osrm.org/route/v1/driving/{_coords_for_order(order)}"
+        params = {"overview": "full", "geometries": "polyline"}
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "Ok" or not data.get("routes"):
+            raise RuntimeError(data.get("message") or "OSRM route failed")
+        rt = data["routes"][0]
+        return {
+            "total_distance_km": round((rt.get("distance") or 0) / 1000.0, 2),
+            "total_duration_min": round((rt.get("duration") or 0) / 60.0, 1),
+            "geometry": rt.get("geometry", ""),
+        }
+
+    def _hav_total(order: List[int]) -> float:
+        cur = factory_ll
+        tot = 0.0
+        for i in order:
+            tot += hav(cur, pts[i])
+            cur = pts[i]
+        return round(tot, 2)
+
+    # ── Build the candidate ORDERS ───────────────────────────────────────
+    selected_order = list(range(len(stops)))
+    # Nearest-neighbour greedy order
     remaining = list(range(len(pts)))
-    order: List[int] = []
-    cur = (FACTORY_LOCATION["lat"], FACTORY_LOCATION["lng"])
-    total = 0.0
+    nn_order: List[int] = []
+    cur = factory_ll
     while remaining:
         nxt = min(remaining, key=lambda i: hav(cur, pts[i]))
-        total += hav(cur, pts[nxt])
-        order.append(nxt)
+        nn_order.append(nxt)
         cur = pts[nxt]
         remaining.remove(nxt)
+
+    options: List[Dict[str, Any]] = []
+    seen_orders = set()
+
+    def _add_option(label, engine, order, metrics):
+        key = tuple(order)
+        if key in seen_orders:
+            return
+        seen_orders.add(key)
+        options.append({
+            "label": label,
+            "engine": engine,
+            "order": order,
+            "total_distance_km": metrics.get("total_distance_km"),
+            "total_duration_min": metrics.get("total_duration_min"),
+            "geometry": metrics.get("geometry", ""),
+        })
+
+    try:
+        async with _httpx.AsyncClient(timeout=20) as c:
+            # 1) OSRM /trip optimized order
+            trip_order = None
+            try:
+                url = f"https://router.project-osrm.org/trip/v1/driving/{_coords_for_order(selected_order)}"
+                params = {"source": "first", "roundtrip": "false", "overview": "full", "geometries": "polyline"}
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("code") == "Ok" and data.get("trips"):
+                    trip = data["trips"][0]
+                    wps = data.get("waypoints") or []
+                    trip_order = [0] * len(stops)
+                    for i, wp in enumerate(wps):
+                        if i == 0:
+                            continue
+                        visit_pos = int(wp.get("waypoint_index", i))
+                        trip_order[visit_pos - 1] = i - 1
+                    _add_option("Shortest (optimized)", "osrm", trip_order, {
+                        "total_distance_km": round((trip.get("distance") or 0) / 1000.0, 2),
+                        "total_duration_min": round((trip.get("duration") or 0) / 60.0, 1),
+                        "geometry": trip.get("geometry", ""),
+                    })
+            except Exception as e:
+                logger.warning("OSRM trip failed: %s", e)
+
+            # 2) Nearest-first (real roads)
+            try:
+                _add_option("Nearest first", "osrm", nn_order, await _osrm_route(c, nn_order))
+            except Exception as e:
+                logger.warning("OSRM nearest-first route failed: %s", e)
+                _add_option("Nearest first", "haversine", nn_order,
+                            {"total_distance_km": _hav_total(nn_order), "total_duration_min": None, "geometry": ""})
+
+            # 3) As-selected order (real roads)
+            try:
+                _add_option("As selected", "osrm", selected_order, await _osrm_route(c, selected_order))
+            except Exception as e:
+                logger.warning("OSRM as-selected route failed: %s", e)
+                _add_option("As selected", "haversine", selected_order,
+                            {"total_distance_km": _hav_total(selected_order), "total_duration_min": None, "geometry": ""})
+    except Exception as e:
+        logger.warning("OSRM unreachable, using haversine fallbacks: %s", e)
+
+    # Guaranteed fallbacks if OSRM produced nothing at all.
+    if not options:
+        _add_option("Nearest first", "haversine", nn_order,
+                    {"total_distance_km": _hav_total(nn_order), "total_duration_min": None, "geometry": ""})
+        _add_option("As selected", "haversine", selected_order,
+                    {"total_distance_km": _hav_total(selected_order), "total_duration_min": None, "geometry": ""})
+
+    # Sort options shortest-first so the best is on top / default.
+    options.sort(key=lambda o: (o.get("total_distance_km") is None, o.get("total_distance_km") or 1e9))
+    best = options[0]
     return {
         "ok": True,
-        "engine": "haversine",
-        "order": order,
-        "total_distance_km": round(total, 2),
-        "total_duration_min": None,
-        "geometry": "",
+        "engine": best["engine"],
+        "order": best["order"],
+        "total_distance_km": best["total_distance_km"],
+        "total_duration_min": best["total_duration_min"],
+        "geometry": best["geometry"],
+        "options": options,
     }
 
 

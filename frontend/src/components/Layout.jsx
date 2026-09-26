@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
 import BrandMark from "@/components/BrandMark";
 import VoiceAgent from "@/components/VoiceAgent";
+import NotificationCenter from "@/components/NotificationCenter";
 
 // Top-level nav items always visible in the main sidebar.
 const NAV = [
@@ -167,6 +168,7 @@ export default function Layout() {
           </div>
           <div className="font-heading font-bold text-slate-900 truncate">{t("nav.appName")}</div>
           <div className="ml-auto flex items-center gap-2">
+            <NotificationCenter />
             <LanguageSwitcher />
             <Button onClick={() => nav("/orders/new")} data-testid="topbar-new-order"
                     className="bg-[#E65100] hover:bg-[#CC4800] text-white rounded-sm h-10 px-4 font-bold active:scale-[0.98]">

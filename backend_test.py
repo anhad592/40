@@ -1,639 +1,444 @@
 #!/usr/bin/env python3
 """
-Backend API Test Suite for Factory Order Management - Auth + OTP + Permissions
-Tests admin/user authentication, OTP flow, and permission management.
+Backend API Test Suite for Factory Order Management System
+Tests OTP LOGIN two-step verification feature
 """
 
 import requests
 import json
 import re
-import sys
-from typing import Optional, Dict, Any
+import subprocess
+from typing import Dict, Any, Optional
 
-# Base URL from frontend/.env
-BASE_URL = "https://dev-clone-7.preview.emergentagent.com/api"
+# Backend URL from environment
+BASE_URL = "https://app-clone-138.preview.emergentagent.com/api"
 
-# Test credentials (seeded users)
-# Can use either email or username for login
-ADMIN_EMAIL = "admin@factory.com"  # or "admin"
-ADMIN_PASSWORD = "admin123"
-USER_EMAIL = "user@factory.com"  # or "user"
-USER_PASSWORD = "user123"
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    END = '\033[0m'
 
-# Color codes for output
-GREEN = '\033[92m'
-RED = '\033[91m'
-YELLOW = '\033[93m'
-BLUE = '\033[94m'
-RESET = '\033[0m'
+def log_success(msg: str):
+    print(f"{Colors.GREEN}✓ {msg}{Colors.END}")
 
-class TestResult:
-    def __init__(self):
-        self.passed = 0
-        self.failed = 0
-        self.tests = []
-    
-    def add_pass(self, test_name: str, details: str = ""):
-        self.passed += 1
-        self.tests.append({"name": test_name, "status": "PASS", "details": details})
-        print(f"{GREEN}✓ PASS{RESET}: {test_name}")
-        if details:
-            print(f"  {details}")
-    
-    def add_fail(self, test_name: str, details: str = ""):
-        self.failed += 1
-        self.tests.append({"name": test_name, "status": "FAIL", "details": details})
-        print(f"{RED}✗ FAIL{RESET}: {test_name}")
-        if details:
-            print(f"  {details}")
-    
-    def summary(self):
-        total = self.passed + self.failed
-        print(f"\n{'='*70}")
-        print(f"TEST SUMMARY: {self.passed}/{total} passed")
-        if self.failed > 0:
-            print(f"{RED}Failed tests:{RESET}")
-            for t in self.tests:
-                if t["status"] == "FAIL":
-                    print(f"  - {t['name']}")
-        print(f"{'='*70}\n")
-        return self.failed == 0
+def log_error(msg: str):
+    print(f"{Colors.RED}✗ {msg}{Colors.END}")
 
-def read_otp_from_logs(challenge_id: str, email: str) -> Optional[str]:
-    """Read OTP code from backend logs."""
-    log_files = [
-        "/var/log/supervisor/backend.out.log",
-        "/var/log/supervisor/backend.err.log"
-    ]
-    
-    pattern = rf"Admin OTP for {re.escape(email)} \(challenge {re.escape(challenge_id)}\): (\d{{6}})"
-    
-    for log_file in log_files:
-        try:
-            with open(log_file, 'r') as f:
-                content = f.read()
-                match = re.search(pattern, content)
-                if match:
-                    return match.group(1)
-        except FileNotFoundError:
-            continue
-        except Exception as e:
-            print(f"{YELLOW}Warning: Error reading {log_file}: {e}{RESET}")
-    
-    return None
+def log_info(msg: str):
+    print(f"{Colors.BLUE}ℹ {msg}{Colors.END}")
 
-def test_admin_login_otp_step1(result: TestResult) -> Optional[Dict[str, Any]]:
-    """Test 1: Admin login should return OTP challenge (no token)."""
-    print(f"\n{BLUE}Test 1: Admin login - OTP required{RESET}")
-    
+def log_warning(msg: str):
+    print(f"{Colors.YELLOW}⚠ {msg}{Colors.END}")
+
+def get_otp_from_logs(email: str, challenge_id: str) -> Optional[str]:
+    """Extract OTP code from backend logs"""
     try:
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
-            timeout=10
+        # Read backend error logs
+        result = subprocess.run(
+            ["tail", "-n", "100", "/var/log/supervisor/backend.err.log"],
+            capture_output=True,
+            text=True,
+            timeout=5
         )
         
-        if response.status_code != 200:
-            result.add_fail("Test 1: Admin login OTP step 1", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
+        if result.returncode != 0:
+            log_error(f"Failed to read backend logs: {result.stderr}")
             return None
         
+        logs = result.stdout
+        
+        # Pattern: "Admin OTP for <email> (challenge <id>): <6-digit-code>"
+        pattern = rf"Admin OTP for {re.escape(email)} \(challenge {re.escape(challenge_id)}\): (\d{{6}})"
+        match = re.search(pattern, logs)
+        
+        if match:
+            otp_code = match.group(1)
+            log_info(f"Found OTP code in logs: {otp_code}")
+            return otp_code
+        else:
+            log_warning(f"OTP code not found in logs for email={email}, challenge={challenge_id}")
+            log_info(f"Log content:\n{logs[-500:]}")  # Show last 500 chars
+            return None
+            
+    except Exception as e:
+        log_error(f"Error reading logs: {e}")
+        return None
+
+def test_admin_login_no_otp():
+    """Test 1: Admin login (otp_login=False) should return token directly"""
+    print("\n" + "="*70)
+    print("TEST 1: Admin login without OTP (otp_login=False)")
+    print("="*70)
+    
+    payload = {
+        "email": "admin",
+        "password": "admin123"
+    }
+    
+    log_info(f"POST {BASE_URL}/auth/login with username='admin'")
+    response = requests.post(f"{BASE_URL}/auth/login", json=payload)
+    
+    log_info(f"Status: {response.status_code}")
+    log_info(f"Response: {json.dumps(response.json(), indent=2)}")
+    
+    if response.status_code != 200:
+        log_error(f"Expected 200, got {response.status_code}")
+        return None
+    
+    data = response.json()
+    
+    # Should NOT have otp_required
+    if "otp_required" in data and data["otp_required"]:
+        log_error("Admin has otp_login=False but got otp_required=True!")
+        return None
+    
+    # Should have token
+    if "token" not in data:
+        log_error("Expected 'token' in response but not found")
+        return None
+    
+    # Should have user object
+    if "user" not in data:
+        log_error("Expected 'user' in response but not found")
+        return None
+    
+    user = data["user"]
+    if user.get("role") != "admin":
+        log_error(f"Expected role='admin', got {user.get('role')}")
+        return None
+    
+    log_success("Admin login returned token directly (no OTP challenge)")
+    log_success(f"User: {user.get('username')} ({user.get('email')}), role={user.get('role')}")
+    
+    return data["token"]
+
+def test_enable_otp_for_user(admin_token: str):
+    """Test 2: Enable OTP for 'user' account"""
+    print("\n" + "="*70)
+    print("TEST 2: Enable OTP for 'user' account")
+    print("="*70)
+    
+    # First, get list of users to find 'user' id
+    headers = {"Authorization": f"Bearer {admin_token}"}
+    
+    log_info(f"GET {BASE_URL}/users")
+    response = requests.get(f"{BASE_URL}/users", headers=headers)
+    
+    if response.status_code != 200:
+        log_error(f"Failed to get users: {response.status_code}")
+        return None
+    
+    users = response.json()
+    user_account = None
+    
+    for u in users:
+        if u.get("username") == "user":
+            user_account = u
+            break
+    
+    if not user_account:
+        log_error("User account with username='user' not found")
+        return None
+    
+    user_id = user_account["id"]
+    log_info(f"Found user account: id={user_id}, email={user_account.get('email')}")
+    log_info(f"Current otp_login status: {user_account.get('otp_login')}")
+    
+    # Enable OTP for this user
+    log_info(f"PATCH {BASE_URL}/users/{user_id}/otp with otp_login=true")
+    response = requests.patch(
+        f"{BASE_URL}/users/{user_id}/otp",
+        json={"otp_login": True},
+        headers=headers
+    )
+    
+    log_info(f"Status: {response.status_code}")
+    
+    if response.status_code != 200:
+        log_error(f"Failed to enable OTP: {response.status_code}")
+        log_error(f"Response: {response.text}")
+        return None
+    
+    updated_user = response.json()
+    log_info(f"Response: {json.dumps(updated_user, indent=2)}")
+    
+    if not updated_user.get("otp_login"):
+        log_error("OTP was not enabled for user")
+        return None
+    
+    log_success(f"OTP enabled for user '{user_account.get('username')}'")
+    return user_id
+
+def test_user_login_with_otp():
+    """Test 3: User login (otp_login=True) should return OTP challenge"""
+    print("\n" + "="*70)
+    print("TEST 3: User login with OTP enabled (should get challenge)")
+    print("="*70)
+    
+    payload = {
+        "email": "user",
+        "password": "user123"
+    }
+    
+    log_info(f"POST {BASE_URL}/auth/login with username='user'")
+    response = requests.post(f"{BASE_URL}/auth/login", json=payload)
+    
+    log_info(f"Status: {response.status_code}")
+    log_info(f"Response: {json.dumps(response.json(), indent=2)}")
+    
+    if response.status_code != 200:
+        log_error(f"Expected 200, got {response.status_code}")
+        return None
+    
+    data = response.json()
+    
+    # Should have otp_required=True
+    if not data.get("otp_required"):
+        log_error("Expected otp_required=True but not found")
+        log_error("BUG: User has otp_login=True but login returned token directly!")
+        return None
+    
+    # Should have challenge_id
+    if "challenge_id" not in data:
+        log_error("Expected 'challenge_id' in response but not found")
+        return None
+    
+    # Should NOT have token
+    if "token" in data:
+        log_error("Got 'token' in response but should only get OTP challenge")
+        return None
+    
+    challenge_id = data["challenge_id"]
+    sent_to = data.get("sent_to")
+    email_sent = data.get("email_sent")
+    
+    log_success("User login returned OTP challenge (no token)")
+    log_success(f"challenge_id: {challenge_id}")
+    log_info(f"sent_to: {sent_to}")
+    log_info(f"email_sent: {email_sent}")
+    
+    return challenge_id
+
+def test_verify_otp(challenge_id: str, otp_code: str):
+    """Test 4: Verify OTP with correct code"""
+    print("\n" + "="*70)
+    print("TEST 4: Verify OTP with correct code")
+    print("="*70)
+    
+    payload = {
+        "challenge_id": challenge_id,
+        "code": otp_code
+    }
+    
+    log_info(f"POST {BASE_URL}/auth/verify-otp")
+    log_info(f"Payload: {json.dumps(payload, indent=2)}")
+    response = requests.post(f"{BASE_URL}/auth/verify-otp", json=payload)
+    
+    log_info(f"Status: {response.status_code}")
+    log_info(f"Response: {json.dumps(response.json(), indent=2)}")
+    
+    if response.status_code != 200:
+        log_error(f"Expected 200, got {response.status_code}")
+        return None
+    
+    data = response.json()
+    
+    # Should have token
+    if "token" not in data:
+        log_error("Expected 'token' in response but not found")
+        return None
+    
+    # Should have user object
+    if "user" not in data:
+        log_error("Expected 'user' in response but not found")
+        return None
+    
+    user = data["user"]
+    
+    log_success("OTP verification successful")
+    log_success(f"Received JWT token: {data['token'][:20]}...")
+    log_success(f"User: {user.get('username')} ({user.get('email')}), role={user.get('role')}")
+    
+    return data["token"]
+
+def test_verify_otp_wrong_code(challenge_id: str):
+    """Test 5: Verify OTP with incorrect code (negative test)"""
+    print("\n" + "="*70)
+    print("TEST 5: Verify OTP with incorrect code (negative test)")
+    print("="*70)
+    
+    payload = {
+        "challenge_id": challenge_id,
+        "code": "000000"  # Wrong code
+    }
+    
+    log_info(f"POST {BASE_URL}/auth/verify-otp with wrong code")
+    response = requests.post(f"{BASE_URL}/auth/verify-otp", json=payload)
+    
+    log_info(f"Status: {response.status_code}")
+    log_info(f"Response: {response.text}")
+    
+    if response.status_code != 401:
+        log_error(f"Expected 401 for wrong OTP, got {response.status_code}")
+        return False
+    
+    # Should NOT have token
+    try:
         data = response.json()
-        
-        # Verify response structure
-        if not data.get("otp_required"):
-            result.add_fail("Test 1: Admin login OTP step 1", 
-                          f"Expected otp_required=true, got: {data}")
-            return None
-        
-        if not data.get("challenge_id"):
-            result.add_fail("Test 1: Admin login OTP step 1", 
-                          "Missing challenge_id in response")
-            return None
-        
         if "token" in data:
-            result.add_fail("Test 1: Admin login OTP step 1", 
-                          "Token should NOT be present in OTP challenge response")
-            return None
-        
-        result.add_pass("Test 1: Admin login OTP step 1", 
-                       f"challenge_id={data['challenge_id']}, sent_to={data.get('sent_to')}, email_sent={data.get('email_sent')}")
-        return data
-        
-    except Exception as e:
-        result.add_fail("Test 1: Admin login OTP step 1", f"Exception: {str(e)}")
-        return None
+            log_error("Got token with wrong OTP code!")
+            return False
+    except:
+        pass
+    
+    log_success("Wrong OTP correctly rejected with 401")
+    return True
 
-def test_admin_verify_otp(result: TestResult, challenge_data: Dict[str, Any]) -> Optional[str]:
-    """Test 2: Verify OTP and get admin token."""
-    print(f"\n{BLUE}Test 2: Admin OTP verification{RESET}")
+def test_disable_otp_for_user(admin_token: str, user_id: str):
+    """Test 6: Disable OTP for user and verify direct login"""
+    print("\n" + "="*70)
+    print("TEST 6: Disable OTP and verify direct login")
+    print("="*70)
     
-    challenge_id = challenge_data.get("challenge_id")
-    if not challenge_id:
-        result.add_fail("Test 2: Admin OTP verification", "No challenge_id from previous test")
-        return None
+    headers = {"Authorization": f"Bearer {admin_token}"}
     
-    # Read OTP from logs
-    otp_code = read_otp_from_logs(challenge_id, "admin@factory.com")
-    if not otp_code:
-        result.add_fail("Test 2: Admin OTP verification", 
-                       f"Could not find OTP in logs for challenge {challenge_id}")
-        return None
+    # Disable OTP
+    log_info(f"PATCH {BASE_URL}/users/{user_id}/otp with otp_login=false")
+    response = requests.patch(
+        f"{BASE_URL}/users/{user_id}/otp",
+        json={"otp_login": False},
+        headers=headers
+    )
     
-    print(f"  Found OTP code: {otp_code}")
+    if response.status_code != 200:
+        log_error(f"Failed to disable OTP: {response.status_code}")
+        return False
     
-    try:
-        response = requests.post(
-            f"{BASE_URL}/auth/verify-otp",
-            json={"challenge_id": challenge_id, "code": otp_code},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 2: Admin OTP verification", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return None
-        
-        data = response.json()
-        
-        if not data.get("token"):
-            result.add_fail("Test 2: Admin OTP verification", "Missing token in response")
-            return None
-        
-        if not data.get("user"):
-            result.add_fail("Test 2: Admin OTP verification", "Missing user in response")
-            return None
-        
-        if data["user"].get("role") != "admin":
-            result.add_fail("Test 2: Admin OTP verification", 
-                          f"Expected role=admin, got {data['user'].get('role')}")
-            return None
-        
-        result.add_pass("Test 2: Admin OTP verification", 
-                       f"Token received, user.role={data['user']['role']}")
-        return data["token"]
-        
-    except Exception as e:
-        result.add_fail("Test 2: Admin OTP verification", f"Exception: {str(e)}")
-        return None
-
-def test_admin_me(result: TestResult, token: str):
-    """Test 2b: Verify /auth/me with admin token."""
-    print(f"\n{BLUE}Test 2b: GET /auth/me with admin token{RESET}")
+    log_success("OTP disabled for user")
     
-    try:
-        response = requests.get(
-            f"{BASE_URL}/auth/me",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 2b: GET /auth/me", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        
-        if data.get("role") != "admin":
-            result.add_fail("Test 2b: GET /auth/me", 
-                          f"Expected role=admin, got {data.get('role')}")
-            return
-        
-        result.add_pass("Test 2b: GET /auth/me", 
-                       f"Admin user verified: {data.get('email')}")
-        
-    except Exception as e:
-        result.add_fail("Test 2b: GET /auth/me", f"Exception: {str(e)}")
-
-def test_wrong_otp(result: TestResult):
-    """Test 3: Wrong OTP should return 401."""
-    print(f"\n{BLUE}Test 3: Wrong OTP code{RESET}")
+    # Now try login - should get token directly
+    log_info("Attempting login with username='user' (should get token directly)")
+    payload = {
+        "email": "user",
+        "password": "user123"
+    }
     
-    # Get a fresh challenge
-    try:
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 3: Wrong OTP", f"Login failed: {response.status_code}")
-            return
-        
-        data = response.json()
-        challenge_id = data.get("challenge_id")
-        
-        if not challenge_id:
-            result.add_fail("Test 3: Wrong OTP", "No challenge_id received")
-            return
-        
-        # Try with wrong code
-        response = requests.post(
-            f"{BASE_URL}/auth/verify-otp",
-            json={"challenge_id": challenge_id, "code": "000000"},
-            timeout=10
-        )
-        
-        if response.status_code != 401:
-            result.add_fail("Test 3: Wrong OTP", 
-                          f"Expected 401, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        if "token" in data:
-            result.add_fail("Test 3: Wrong OTP", "Token should NOT be present on wrong OTP")
-            return
-        
-        result.add_pass("Test 3: Wrong OTP", "Correctly rejected with 401")
-        
-    except Exception as e:
-        result.add_fail("Test 3: Wrong OTP", f"Exception: {str(e)}")
-
-def test_non_otp_user(result: TestResult) -> Optional[str]:
-    """Test 4: Non-OTP user should get direct token."""
-    print(f"\n{BLUE}Test 4: Non-OTP user login (direct token){RESET}")
+    response = requests.post(f"{BASE_URL}/auth/login", json=payload)
     
-    try:
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"email": USER_EMAIL, "password": USER_PASSWORD},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 4: Non-OTP user login", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return None
-        
-        data = response.json()
-        
-        if data.get("otp_required"):
-            result.add_fail("Test 4: Non-OTP user login", 
-                          "otp_required should be false/absent for non-OTP user")
-            return None
-        
-        if not data.get("token"):
-            result.add_fail("Test 4: Non-OTP user login", "Missing token in response")
-            return None
-        
-        if not data.get("user"):
-            result.add_fail("Test 4: Non-OTP user login", "Missing user in response")
-            return None
-        
-        if data["user"].get("role") != "user":
-            result.add_fail("Test 4: Non-OTP user login", 
-                          f"Expected role=user, got {data['user'].get('role')}")
-            return None
-        
-        result.add_pass("Test 4: Non-OTP user login", 
-                       f"Direct token received, user.role={data['user']['role']}")
-        return data["token"]
-        
-    except Exception as e:
-        result.add_fail("Test 4: Non-OTP user login", f"Exception: {str(e)}")
-        return None
-
-def test_toggle_otp(result: TestResult, admin_token: str):
-    """Test 5: Toggle OTP for user, verify it works, then toggle back."""
-    print(f"\n{BLUE}Test 5: Toggle OTP for user{RESET}")
+    if response.status_code != 200:
+        log_error(f"Login failed: {response.status_code}")
+        return False
     
-    try:
-        # Get list of users to find the 'user' operator
-        response = requests.get(
-            f"{BASE_URL}/users",
-            headers={"Authorization": f"Bearer {admin_token}"},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 5: Toggle OTP - list users", 
-                          f"Expected 200, got {response.status_code}")
-            return
-        
-        users = response.json()
-        user_operator = None
-        for u in users:
-            if u.get("username") == "user" or u.get("email") == "user@factory.com":
-                user_operator = u
-                break
-        
-        if not user_operator:
-            result.add_fail("Test 5: Toggle OTP", "Could not find 'user' operator")
-            return
-        
-        user_id = user_operator["id"]
-        print(f"  Found user operator: {user_id}")
-        
-        # Step 1: Enable OTP for user
-        response = requests.patch(
-            f"{BASE_URL}/users/{user_id}/otp",
-            headers={"Authorization": f"Bearer {admin_token}"},
-            json={"otp_login": True},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 5: Toggle OTP - enable", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        if not data.get("otp_login"):
-            result.add_fail("Test 5: Toggle OTP - enable", 
-                          f"otp_login should be true, got {data.get('otp_login')}")
-            return
-        
-        print(f"  {GREEN}✓{RESET} OTP enabled for user")
-        
-        # Step 2: Try login - should now require OTP
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"email": USER_EMAIL, "password": USER_PASSWORD},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 5: Toggle OTP - login with OTP", 
-                          f"Expected 200, got {response.status_code}")
-            return
-        
-        data = response.json()
-        if not data.get("otp_required"):
-            result.add_fail("Test 5: Toggle OTP - login with OTP", 
-                          "otp_required should be true after enabling OTP")
-            return
-        
-        challenge_id = data.get("challenge_id")
-        print(f"  {GREEN}✓{RESET} OTP now required for user login, challenge_id={challenge_id}")
-        
-        # Step 3: Read OTP and verify
-        otp_code = read_otp_from_logs(challenge_id, "user@factory.com")
-        if not otp_code:
-            result.add_fail("Test 5: Toggle OTP - verify OTP", 
-                          f"Could not find OTP in logs for challenge {challenge_id}")
-            return
-        
-        response = requests.post(
-            f"{BASE_URL}/auth/verify-otp",
-            json={"challenge_id": challenge_id, "code": otp_code},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 5: Toggle OTP - verify OTP", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        if not data.get("token"):
-            result.add_fail("Test 5: Toggle OTP - verify OTP", "Missing token")
-            return
-        
-        print(f"  {GREEN}✓{RESET} OTP verification successful")
-        
-        # Step 4: Disable OTP for user
-        response = requests.patch(
-            f"{BASE_URL}/users/{user_id}/otp",
-            headers={"Authorization": f"Bearer {admin_token}"},
-            json={"otp_login": False},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 5: Toggle OTP - disable", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        if data.get("otp_login"):
-            result.add_fail("Test 5: Toggle OTP - disable", 
-                          f"otp_login should be false, got {data.get('otp_login')}")
-            return
-        
-        print(f"  {GREEN}✓{RESET} OTP disabled for user")
-        
-        # Step 5: Verify login now returns direct token
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"email": USER_EMAIL, "password": USER_PASSWORD},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 5: Toggle OTP - final login", 
-                          f"Expected 200, got {response.status_code}")
-            return
-        
-        data = response.json()
-        if data.get("otp_required"):
-            result.add_fail("Test 5: Toggle OTP - final login", 
-                          "otp_required should be false after disabling OTP")
-            return
-        
-        if not data.get("token"):
-            result.add_fail("Test 5: Toggle OTP - final login", "Missing token")
-            return
-        
-        print(f"  {GREEN}✓{RESET} Direct token login restored")
-        
-        result.add_pass("Test 5: Toggle OTP for user", "All steps passed")
-        
-    except Exception as e:
-        result.add_fail("Test 5: Toggle OTP", f"Exception: {str(e)}")
-
-def test_create_restricted_user(result: TestResult, admin_token: str):
-    """Test 6: Create restricted user with permissions."""
-    print(f"\n{BLUE}Test 6: Create restricted user with permissions{RESET}")
+    data = response.json()
     
-    try:
-        # Create user with newOrder permission
-        response = requests.post(
-            f"{BASE_URL}/users",
-            headers={"Authorization": f"Bearer {admin_token}"},
-            json={
-                "email": "neworder@factory.com",
-                "name": "New Order Only",
-                "password": "order123",
-                "role": "user",
-                "username": "orderonly",
-                "otp_login": False,
-                "permissions": ["newOrder"]
-            },
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 6: Create restricted user", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        
-        if data.get("otp_login"):
-            result.add_fail("Test 6: Create restricted user", 
-                          f"otp_login should be false, got {data.get('otp_login')}")
-            return
-        
-        if data.get("permissions") != ["newOrder"]:
-            result.add_fail("Test 6: Create restricted user", 
-                          f"Expected permissions=['newOrder'], got {data.get('permissions')}")
-            return
-        
-        print(f"  {GREEN}✓{RESET} User created with permissions={data.get('permissions')}")
-        
-        # Login as the new user
-        response = requests.post(
-            f"{BASE_URL}/auth/login",
-            json={"email": "orderonly", "password": "order123"},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 6: Create restricted user - login", 
-                          f"Expected 200, got {response.status_code}: {response.text}")
-            return
-        
-        data = response.json()
-        
-        if data.get("otp_required"):
-            result.add_fail("Test 6: Create restricted user - login", 
-                          "otp_required should be false")
-            return
-        
-        if not data.get("token"):
-            result.add_fail("Test 6: Create restricted user - login", "Missing token")
-            return
-        
-        token = data["token"]
-        print(f"  {GREEN}✓{RESET} Login successful (direct token)")
-        
-        # Verify /auth/me shows permissions
-        response = requests.get(
-            f"{BASE_URL}/auth/me",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            result.add_fail("Test 6: Create restricted user - /auth/me", 
-                          f"Expected 200, got {response.status_code}")
-            return
-        
-        data = response.json()
-        
-        if data.get("permissions") != ["newOrder"]:
-            result.add_fail("Test 6: Create restricted user - /auth/me", 
-                          f"Expected permissions=['newOrder'], got {data.get('permissions')}")
-            return
-        
-        print(f"  {GREEN}✓{RESET} /auth/me shows permissions={data.get('permissions')}")
-        
-        result.add_pass("Test 6: Create restricted user", "All steps passed")
-        
-    except Exception as e:
-        result.add_fail("Test 6: Create restricted user", f"Exception: {str(e)}")
-
-def test_invalid_permission(result: TestResult, admin_token: str):
-    """Test 7: Invalid permission should return 400."""
-    print(f"\n{BLUE}Test 7: Invalid permission on create{RESET}")
+    # Should NOT have otp_required
+    if data.get("otp_required"):
+        log_error("User has otp_login=False but got OTP challenge!")
+        return False
     
-    try:
-        response = requests.post(
-            f"{BASE_URL}/users",
-            headers={"Authorization": f"Bearer {admin_token}"},
-            json={
-                "email": "invalid@factory.com",
-                "name": "Invalid User",
-                "password": "test123",
-                "role": "user",
-                "username": "invalid",
-                "otp_login": False,
-                "permissions": ["bogusKey"]
-            },
-            timeout=10
-        )
-        
-        if response.status_code != 400:
-            result.add_fail("Test 7: Invalid permission", 
-                          f"Expected 400, got {response.status_code}: {response.text}")
-            return
-        
-        result.add_pass("Test 7: Invalid permission", "Correctly rejected with 400")
-        
-    except Exception as e:
-        result.add_fail("Test 7: Invalid permission", f"Exception: {str(e)}")
-
-def test_patch_otp_nonexistent_user(result: TestResult, admin_token: str):
-    """Test 8: PATCH OTP on non-existent user should return 404."""
-    print(f"\n{BLUE}Test 8: PATCH OTP on non-existent user{RESET}")
+    # Should have token
+    if "token" not in data:
+        log_error("Expected token but not found")
+        return False
     
-    try:
-        fake_id = "00000000-0000-0000-0000-000000000000"
-        response = requests.patch(
-            f"{BASE_URL}/users/{fake_id}/otp",
-            headers={"Authorization": f"Bearer {admin_token}"},
-            json={"otp_login": True},
-            timeout=10
-        )
-        
-        if response.status_code != 404:
-            result.add_fail("Test 8: PATCH OTP non-existent user", 
-                          f"Expected 404, got {response.status_code}: {response.text}")
-            return
-        
-        result.add_pass("Test 8: PATCH OTP non-existent user", "Correctly returned 404")
-        
-    except Exception as e:
-        result.add_fail("Test 8: PATCH OTP non-existent user", f"Exception: {str(e)}")
+    log_success("User login returned token directly (no OTP challenge)")
+    return True
 
 def main():
-    print(f"\n{'='*70}")
-    print(f"Factory Order Management - Auth + OTP + Permissions Test Suite")
-    print(f"Base URL: {BASE_URL}")
-    print(f"{'='*70}\n")
+    print("\n" + "="*70)
+    print("FACTORY ORDER MANAGEMENT - OTP LOGIN VERIFICATION TEST")
+    print("="*70)
+    print(f"Backend URL: {BASE_URL}")
+    print("="*70)
     
-    result = TestResult()
+    results = {
+        "passed": 0,
+        "failed": 0,
+        "total": 6
+    }
     
-    # Test 1: Admin login OTP step 1
-    challenge_data = test_admin_login_otp_step1(result)
-    if not challenge_data:
-        print(f"\n{RED}Cannot continue without admin challenge data{RESET}")
-        result.summary()
-        return 1
+    # Test 1: Admin login without OTP
+    admin_token = test_admin_login_no_otp()
+    if admin_token:
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
+        log_error("TEST 1 FAILED - Cannot continue")
+        print_summary(results)
+        return
     
-    # Test 2: Admin OTP verification
-    admin_token = test_admin_verify_otp(result, challenge_data)
-    if not admin_token:
-        print(f"\n{RED}Cannot continue without admin token{RESET}")
-        result.summary()
-        return 1
+    # Test 2: Enable OTP for user
+    user_id = test_enable_otp_for_user(admin_token)
+    if user_id:
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
+        log_error("TEST 2 FAILED - Cannot continue")
+        print_summary(results)
+        return
     
-    # Test 2b: Verify /auth/me
-    test_admin_me(result, admin_token)
+    # Test 3: User login with OTP enabled
+    challenge_id = test_user_login_with_otp()
+    if challenge_id:
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
+        log_error("TEST 3 FAILED - Cannot continue")
+        print_summary(results)
+        return
     
-    # Test 3: Wrong OTP
-    test_wrong_otp(result)
+    # Test 4: Get OTP from logs and verify
+    otp_code = get_otp_from_logs("user@factory.com", challenge_id)
+    if not otp_code:
+        log_error("Could not retrieve OTP from logs - Cannot continue")
+        results["failed"] += 1
+        print_summary(results)
+        return
     
-    # Test 4: Non-OTP user
-    user_token = test_non_otp_user(result)
+    user_token = test_verify_otp(challenge_id, otp_code)
+    if user_token:
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
     
-    # Test 5: Toggle OTP for user
-    test_toggle_otp(result, admin_token)
+    # Test 5: Create new challenge for negative test
+    log_info("\nCreating new OTP challenge for negative test...")
+    challenge_id_2 = test_user_login_with_otp()
+    if challenge_id_2:
+        if test_verify_otp_wrong_code(challenge_id_2):
+            results["passed"] += 1
+        else:
+            results["failed"] += 1
+    else:
+        log_error("Could not create challenge for negative test")
+        results["failed"] += 1
     
-    # Test 6: Create restricted user
-    test_create_restricted_user(result, admin_token)
+    # Test 6: Disable OTP and verify direct login
+    if test_disable_otp_for_user(admin_token, user_id):
+        results["passed"] += 1
+    else:
+        results["failed"] += 1
     
-    # Test 7: Invalid permission
-    test_invalid_permission(result, admin_token)
+    print_summary(results)
+
+def print_summary(results: Dict[str, int]):
+    print("\n" + "="*70)
+    print("TEST SUMMARY")
+    print("="*70)
+    print(f"Total Tests: {results['total']}")
+    print(f"{Colors.GREEN}Passed: {results['passed']}{Colors.END}")
+    print(f"{Colors.RED}Failed: {results['failed']}{Colors.END}")
     
-    # Test 8: PATCH OTP on non-existent user
-    test_patch_otp_nonexistent_user(result, admin_token)
-    
-    # Summary
-    success = result.summary()
-    return 0 if success else 1
+    if results['failed'] == 0:
+        print(f"\n{Colors.GREEN}{'='*70}")
+        print("ALL TESTS PASSED ✓")
+        print(f"{'='*70}{Colors.END}\n")
+    else:
+        print(f"\n{Colors.RED}{'='*70}")
+        print("SOME TESTS FAILED ✗")
+        print(f"{'='*70}{Colors.END}\n")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -53,6 +53,10 @@ const isLudhianaLocation = (...parts) => {
 export default function DailyReport() {
   const { isAdmin } = useAuth();
   const [date, setDate] = useState(todayYmd());
+  // Single day vs multi-day range. In range mode the report covers
+  // [date .. endDate] inclusive (IST days).
+  const [mode, setMode] = useState("single"); // "single" | "range"
+  const [endDate, setEndDate] = useState(todayYmd());
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [collapsed, setCollapsed] = useState({});
@@ -65,6 +69,7 @@ export default function DailyReport() {
   const [editingDispatch, setEditingDispatch] = useState(null);
   // Local mirror so the picker label can update without re-fetch
   const [datePopoverOpen, setDatePopoverOpen] = useState(false);
+  const [endPopoverOpen, setEndPopoverOpen] = useState(false);
 
   const dispatchEdit = (did, field) => edits[`dispatch:${did}`]?.[field];
   const customerEdit = (cid, field) => edits[`customer:${cid}`]?.[field];
@@ -183,10 +188,14 @@ export default function DailyReport() {
   };
 
 
-  const load = async (d) => {
+  const load = async (d, ed, m) => {
+    const useMode = m || mode;
+    const from = d || date;
+    const to = ed || endDate;
     setLoading(true);
     try {
-      const r = await api.get("/reports/daily-dispatch", { params: { date: d } });
+      const params = useMode === "range" ? { date: from, end_date: to } : { date: from };
+      const r = await api.get("/reports/daily-dispatch", { params });
       setData(r.data);
       setCollapsed({});
     } catch (e) {
@@ -213,7 +222,7 @@ export default function DailyReport() {
     }
   };
 
-  useEffect(() => { load(date); }, [date]);
+  useEffect(() => { load(); }, [date, endDate, mode]);
 
   // Sort so the LATEST slip lands at the top: within each customer group
   // we sort dispatches by slip_no DESC, then sort the groups themselves
@@ -345,63 +354,140 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
         <div className="text-sm text-slate-500">
           Grouped by party with item-wise pricing &amp; transport.
         </div>
-        <div className="flex items-end gap-2">
+        <div className="flex items-end gap-2 flex-wrap">
           <div>
             <div className="flex items-center gap-2">
               <Label className="text-xs font-bold uppercase">Date</Label>
               <IstBadge />
-            </div>
-            <Popover open={datePopoverOpen} onOpenChange={setDatePopoverOpen}>
-              <PopoverTrigger asChild>
-                <Button
-                  variant="outline"
-                  data-testid="report-date-input"
-                  className="mt-1 h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[180px]"
+              {/* Single day vs multi-day range selector */}
+              <div className="flex rounded-sm border border-slate-300 overflow-hidden" data-testid="report-mode-toggle">
+                <button
+                  type="button"
+                  onClick={() => setMode("single")}
+                  data-testid="report-mode-single"
+                  className={`px-2.5 h-6 text-[11px] font-bold transition-colors ${
+                    mode === "single" ? "bg-[#E65100] text-white" : "bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
                 >
-                  <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
-                  {date}
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent
-                className="w-auto p-0 rounded-sm"
-                align="start"
-                data-testid="report-date-popover"
-              >
-                <CalendarUI
-                  mode="single"
-                  size="lg"
-                  selected={(() => {
-                    const [y, m, d] = (date || "").split("-").map(Number);
-                    return y ? new Date(y, m - 1, d) : new Date();
-                  })()}
-                  onSelect={(d) => {
-                    if (!d) return;
-                    const y = d.getFullYear();
-                    const m = String(d.getMonth() + 1).padStart(2, "0");
-                    const dd = String(d.getDate()).padStart(2, "0");
-                    setDate(`${y}-${m}-${dd}`);
-                    setDatePopoverOpen(false);
+                  Single day
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMode("range");
+                    if (endDate < date) setEndDate(date);
                   }}
-                  initialFocus
-                />
-              </PopoverContent>
-            </Popover>
+                  data-testid="report-mode-range"
+                  className={`px-2.5 h-6 text-[11px] font-bold transition-colors border-l border-slate-300 ${
+                    mode === "range" ? "bg-[#E65100] text-white" : "bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  Date range
+                </button>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
+              <Popover open={datePopoverOpen} onOpenChange={setDatePopoverOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="outline"
+                    data-testid="report-date-input"
+                    className="h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[150px]"
+                  >
+                    <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+                    {date}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  className="w-auto p-0 rounded-sm"
+                  align="start"
+                  data-testid="report-date-popover"
+                >
+                  <CalendarUI
+                    mode="single"
+                    size="lg"
+                    selected={(() => {
+                      const [y, m, d] = (date || "").split("-").map(Number);
+                      return y ? new Date(y, m - 1, d) : new Date();
+                    })()}
+                    onSelect={(d) => {
+                      if (!d) return;
+                      const y = d.getFullYear();
+                      const m = String(d.getMonth() + 1).padStart(2, "0");
+                      const dd = String(d.getDate()).padStart(2, "0");
+                      const next = `${y}-${m}-${dd}`;
+                      setDate(next);
+                      if (mode === "range" && endDate < next) setEndDate(next);
+                      setDatePopoverOpen(false);
+                    }}
+                    initialFocus
+                  />
+                </PopoverContent>
+              </Popover>
+              {mode === "range" && (
+                <>
+                  <span className="text-xs font-bold text-slate-400 uppercase">to</span>
+                  <Popover open={endPopoverOpen} onOpenChange={setEndPopoverOpen}>
+                    <PopoverTrigger asChild>
+                      <Button
+                        variant="outline"
+                        data-testid="report-end-date-input"
+                        className="h-10 rounded-sm border-slate-300 bg-white font-mono-num text-slate-900 pl-9 pr-3 justify-start relative min-w-[150px]"
+                      >
+                        <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+                        {endDate}
+                      </Button>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      className="w-auto p-0 rounded-sm"
+                      align="start"
+                      data-testid="report-end-date-popover"
+                    >
+                      <CalendarUI
+                        mode="single"
+                        size="lg"
+                        selected={(() => {
+                          const [y, m, d] = (endDate || "").split("-").map(Number);
+                          return y ? new Date(y, m - 1, d) : new Date();
+                        })()}
+                        onSelect={(d) => {
+                          if (!d) return;
+                          const y = d.getFullYear();
+                          const m = String(d.getMonth() + 1).padStart(2, "0");
+                          const dd = String(d.getDate()).padStart(2, "0");
+                          const next = `${y}-${m}-${dd}`;
+                          if (next < date) {
+                            toast.error("End date start date se pehle nahi ho sakti");
+                            return;
+                          }
+                          setEndDate(next);
+                          setEndPopoverOpen(false);
+                        }}
+                        initialFocus
+                      />
+                    </PopoverContent>
+                  </Popover>
+                </>
+              )}
+              <Button
+                onClick={doPrint}
+                variant="outline"
+                data-testid="report-print-btn"
+                className="rounded-sm border-slate-300 h-10"
+              >
+                <Printer className="w-4 h-4 mr-1.5" /> Print / Save PDF
+              </Button>
+            </div>
           </div>
-          <Button
-            onClick={doPrint}
-            variant="outline"
-            data-testid="report-print-btn"
-            className="rounded-sm border-slate-300 h-10"
-          >
-            <Printer className="w-4 h-4 mr-1.5" /> Print / Save PDF
-          </Button>
         </div>
       </div>
 
       {/* Print header */}
       <div className="hidden print:block">
         <h1 className="text-2xl font-bold">JK Products — Dispatch Report</h1>
-        <div className="text-sm text-slate-600">{data?.date}</div>
+        <div className="text-sm text-slate-600">
+          {data?.end_date && data.end_date !== data?.date ? `${data.date} to ${data.end_date}` : data?.date}
+        </div>
       </div>
 
       {/* Summary tiles */}
@@ -696,11 +782,19 @@ body { padding: 12mm; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI"
                             className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end"
                             data-testid={`report-dispatch-edit-${dsp.id}`}
                           >
-                            <div className="sm:col-span-2 text-xs uppercase tracking-wider text-slate-800 font-extrabold flex items-center gap-1.5">
+                            <div className="sm:col-span-2 text-xs uppercase tracking-wider text-slate-800 font-extrabold flex items-center gap-1.5 flex-wrap">
                               <span className="inline-flex items-baseline gap-1.5 px-2 py-1 rounded-sm bg-orange-50 border border-orange-200">
                                 <span className="text-[11px] text-[#E65100]">Slip #</span>
                                 <span className="font-mono text-sm font-black text-slate-900 tabular-nums">{dsp.slip_no ?? dsp.id.slice(0, 8).toUpperCase()}</span>
                               </span>
+                              {mode === "range" && dsp.dispatched_at && (
+                                <span
+                                  className="inline-flex items-center px-1.5 py-0.5 rounded-sm bg-sky-50 border border-sky-200 text-[10px] font-bold text-sky-700 normal-case font-mono-num"
+                                  data-testid={`report-dispatch-date-${dsp.id}`}
+                                >
+                                  {new Date(dsp.dispatched_at).toLocaleDateString("en-IN", { day: "2-digit", month: "short", timeZone: "Asia/Kolkata" })}
+                                </span>
+                              )}
                               {!canEdit && (
                                 <span title={lockMsg} className="inline-flex items-center text-amber-600" data-testid={`report-dispatch-locked-${dsp.id}`}>
                                   <Lock className="w-3 h-3" />

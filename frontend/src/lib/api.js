@@ -16,13 +16,17 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (r) => r,
   (err) => {
-    if (err?.response?.status === 401) {
-      // The stored token is invalid or its user no longer exists
+    if (err?.response?.status === 401 ||
+        (err?.response?.status === 403 && err?.response?.data?.detail === "Not authenticated")) {
+      // The stored token is invalid, missing, or its user no longer exists
       // (e.g. after a database restore that replaced the users
-      // collection). Instead of leaving the app in a broken state where
-      // every request fails with "User not found" / "Invalid token" and
-      // stale cached IDs trigger "Customer not found", clear the session
-      // and bounce the user to a clean login screen.
+      // collection, an expired JWT, or a request that raced ahead of the
+      // token being attached — FastAPI's HTTPBearer returns 403
+      // "Not authenticated" when the header is absent). Instead of leaving
+      // the app in a broken state where every request fails with
+      // "User not found" / "Invalid token" / "Not authenticated" and stale
+      // cached IDs trigger "Customer not found", clear the session and
+      // bounce the user to a clean login screen.
       const url = err?.config?.url || "";
       const isAuthCall = url.includes("/auth/login") || url.includes("/auth/verify-otp");
       if (!isAuthCall) {

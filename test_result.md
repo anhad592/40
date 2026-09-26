@@ -102,10 +102,10 @@
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
 
-user_problem_statement: "Test the updated admin/user auth + OTP + permissions backend for the Factory Order Management app"
+user_problem_statement: "Verify OTP LOGIN two-step verification bug fix - per-user otp_login toggle now honored (OTP_LOGIN_ENABLED changed from False to True)"
 
 backend:
-  - task: "Admin login with OTP (step 1)"
+  - task: "OTP LOGIN Bug Fix Verification"
     implemented: true
     working: true
     file: "/app/backend/server.py"
@@ -115,125 +115,17 @@ backend:
     status_history:
       - working: true
         agent: "testing"
-        comment: "Admin login with email='admin@factory.com' and password='admin123' correctly returns otp_required=true, challenge_id, sent_to (masked email), and email_sent=true. No token is returned at this stage as expected."
-
-  - task: "Admin OTP verification (step 2)"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "OTP verification successful. OTP code was read from backend logs (/var/log/supervisor/backend.out.log) using pattern 'Admin OTP for <email> (challenge <challenge_id>): <6-digit-code>'. POST /auth/verify-otp with correct code returns token and user object with role='admin'."
-
-  - task: "GET /auth/me endpoint"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "GET /auth/me with Bearer token correctly returns admin user details including email, role, and permissions."
-
-  - task: "Wrong OTP rejection"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "POST /auth/verify-otp with incorrect code (000000) correctly returns 401 status with no token. Error handling works as expected."
-
-  - task: "Non-OTP user direct login"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "User with otp_login=false (email='user@factory.com', password='user123') correctly receives direct token response with no otp_required flag. User object has role='user'."
-
-  - task: "Toggle OTP for user (PATCH /users/{uid}/otp)"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "Admin can successfully toggle OTP requirement for any user. Test verified: (1) PATCH /users/{uid}/otp with otp_login=true updates user, (2) subsequent login requires OTP, (3) OTP verification works, (4) PATCH back to otp_login=false restores direct token login. All steps passed."
-
-  - task: "Create restricted user with permissions"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "POST /users with permissions=['newOrder'] successfully creates user with restricted permissions. User can login (direct token since otp_login=false), and GET /auth/me correctly returns permissions=['newOrder']. Permission validation works correctly."
-
-  - task: "Invalid permission rejection"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "POST /users with invalid permission key 'bogusKey' correctly returns 400 status. Permission validation against ALL_PERMISSION_KEYS catalog works as expected."
-
-  - task: "PATCH OTP on non-existent user"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "PATCH /users/{fake_id}/otp with non-existent user ID correctly returns 404 status. Error handling works as expected."
-
-  - task: "GET /users (list users)"
-    implemented: true
-    working: true
-    file: "/app/backend/server.py"
-    stuck_count: 0
-    priority: "high"
-    needs_retesting: false
-    status_history:
-      - working: true
-        agent: "testing"
-        comment: "GET /users with admin token successfully returns list of all users (excluding password field). Used in Test 5 to find user operator ID."
+        comment: "BUG FIX VERIFIED: The per-user otp_login toggle is now correctly honored. Previously OTP_LOGIN_ENABLED was hardcoded to False (line 779), now set to True. Comprehensive test suite executed with 6 test cases, all passed: (1) Admin with otp_login=False gets token directly without OTP challenge ✓ (2) Admin can enable OTP for user via PATCH /users/{uid}/otp ✓ (3) User with otp_login=True receives OTP challenge (otp_required=true, challenge_id) instead of token ✓ (4) OTP code retrieved from backend logs (/var/log/supervisor/backend.err.log) and verified successfully, returns valid JWT token ✓ (5) Incorrect OTP code correctly rejected with 401 status ✓ (6) Disabling OTP for user restores direct token login ✓. The bug is FIXED - users with otp_login ON are now required to complete OTP verification, users with otp_login OFF get direct token access."
 
 frontend:
   # No frontend testing performed as per system prompt instructions
 
 metadata:
   created_by: "testing_agent"
-  version: "1.0"
-  test_sequence: 1
+  version: "1.1"
+  test_sequence: 2
   run_ui: false
-  last_tested: "2026-08-08T13:25:00Z"
+  last_tested: "2026-09-26T19:30:00Z"
 
 test_plan:
   current_focus: []
@@ -243,4 +135,4 @@ test_plan:
 
 agent_communication:
   - agent: "testing"
-    message: "Completed comprehensive backend testing of auth + OTP + permissions features. All 8 test cases passed successfully. Note: Had to reset admin and user passwords in database as they were not matching expected values (admin123/user123). Also reset user's otp_login back to false to match seeded state. Test credentials documented in /app/memory/test_credentials.md. Backend test script available at /app/backend_test.py for future regression testing."
+    message: "OTP LOGIN BUG FIX VERIFICATION COMPLETE - All tests passed (6/6). The reported bug is FIXED. Previously, OTP_LOGIN_ENABLED was hardcoded to False at line 779 in server.py, causing the per-user otp_login toggle to be ignored. This has been changed to True. Verified end-to-end: users with otp_login=True now correctly receive OTP challenges and must verify before getting a token; users with otp_login=False get direct token access without OTP. OTP codes are logged to /var/log/supervisor/backend.err.log for testing/recovery. Negative test (wrong OTP) correctly returns 401. Toggle functionality (PATCH /users/{uid}/otp) works bidirectionally. Test credentials: admin/admin123 (otp_login=False), user/user123 (toggled during test). Backend test script updated at /app/backend_test.py."

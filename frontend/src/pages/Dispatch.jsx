@@ -398,9 +398,9 @@ function StockMatchDispatch() {
                   {result.per_item_allocated.map((a) => (
                     <div key={a.item_id} className="px-5 py-2.5 flex items-center justify-between" data-testid={`alloc-${a.item_id}`}>
                       <div className="min-w-0 pr-3">
-                        <div className="font-semibold text-slate-900 text-sm truncate">{a.item_name}</div>
+                        <div className="font-semibold text-slate-900 text-sm break-words">{a.item_name}</div>
                         {a.product_name && (
-                          <div className="text-[11px] text-slate-400 truncate">{a.product_name}</div>
+                          <div className="text-[11px] text-slate-400 break-words">{a.product_name}</div>
                         )}
                       </div>
                       <span className="number-pill shrink-0">{a.allocated_qty} {t("common.pcs")}</span>

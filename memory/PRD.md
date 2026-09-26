@@ -34,3 +34,10 @@ Full-stack Factory Order Management ERP (React + FastAPI + MongoDB): user roles,
 - Test repo 39 flows when user requests (user declined testing for the sync)
 - Optional: brand the Facebook-style login page with JK Products identity
 - Optional: fix `/api/health` route ordering (one line move)
+
+## Feature Log
+- 2026-09-26: "Avoid railway crossing" route option added to TransportRoutes (Daily Report → Transport tab).
+  - Backend `/api/transport/optimize` (server.py ~8010+): new helpers `_decode_polyline`, `_encode_polyline`, `_hav_km`, `_pt_seg_km`, `_crossings_on`, `_fetch_railway_features` (Overpass, 3-mirror fallback + 1hr cache), `_osrm_geojson`, `_nearby_bridges`, `_build_avoidance_route`.
+  - Every route option now carries a `crossings` count (railway level crossings within 30m of its geometry). New option "Avoid railway crossing" reroutes each leg via nearby road bridges/flyovers (OSM `bridge=yes`+highway) to minimise phatak crossings. Best-effort: depends on OSM data + Overpass availability; falls back gracefully (skips option) if Overpass unreachable.
+  - Frontend TransportRoutes.jsx: option buttons show a TrainFront icon + phatak count (green if 0, amber if >0). testid `tr-route-option-crossings-{i}`.
+  - Verified end-to-end via preview (token-injected, admin password unknown after user's backup restore): 4 buttons render with counts; helper unit tests pass.

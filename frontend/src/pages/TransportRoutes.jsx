@@ -13,7 +13,7 @@ import { toast } from "sonner";
 import {
   MapPin, Factory, Plus, Trash2, Route as RouteIcon, Save, Loader2, ListChecks,
   Map as MapIcon, Satellite, Pencil, Check, X, Crosshair, Truck, Navigation, Copy, ExternalLink, Search,
-  Package, CalendarDays, Printer,
+  Package, CalendarDays, Printer, TrainFront,
 } from "lucide-react";
 import DatePicker from "@/components/DatePicker";
 import { todayIso } from "@/lib/dates";
@@ -1062,6 +1062,22 @@ export default function TransportRoutes() {
                   {opt.total_distance_km != null && (
                     <span className={`font-mono-num ${active ? "text-white/90" : "text-[#E65100]"}`}>
                       {opt.total_distance_km} km
+                    </span>
+                  )}
+                  {opt.crossings != null && (
+                    <span
+                      className={`inline-flex items-center gap-0.5 font-mono-num rounded-sm px-1 ${
+                        active
+                          ? "text-white/90"
+                          : opt.crossings === 0
+                          ? "text-emerald-600"
+                          : "text-amber-600"
+                      }`}
+                      data-testid={`tr-route-option-crossings-${i}`}
+                      title={opt.crossings === 0 ? "No railway crossings on this route" : `${opt.crossings} railway crossing(s) on this route`}
+                    >
+                      <TrainFront className="w-3 h-3" />
+                      {opt.crossings}
                     </span>
                   )}
                 </button>

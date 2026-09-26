@@ -8007,6 +8007,229 @@ async def transport_geocode(body: GeocodeIn, _user=Depends(get_current_user)):
     return {"results": results}
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Railway-crossing avoidance helpers (used by /transport/optimize to offer an
+# "Avoid railway crossing" route that prefers flyovers / road-over-bridges).
+# ────────────────────────────────────────────────────────────────────────
+import time as _time
+from math import radians as _rad, sin as _sin, cos as _cos, asin as _asin, sqrt as _sqrt, hypot as _hypot
+
+_overpass_cache: Dict[str, Any] = {}   # bbox-key -> {"ts", "crossings", "bridges"}
+_OVERPASS_TTL = 3600                    # seconds
+
+
+def _decode_polyline(s: str, precision: int = 5):
+    """Decode a Google/OSRM encoded polyline into a list of (lat, lng)."""
+    if not s:
+        return []
+    factor = 10 ** precision
+    index = lat = lng = 0
+    coords = []
+    n = len(s)
+    while index < n:
+        shift = result = 0
+        while True:
+            b = ord(s[index]) - 63; index += 1
+            result |= (b & 0x1f) << shift; shift += 5
+            if b < 0x20:
+                break
+        lat += ~(result >> 1) if (result & 1) else (result >> 1)
+        shift = result = 0
+        while True:
+            b = ord(s[index]) - 63; index += 1
+            result |= (b & 0x1f) << shift; shift += 5
+            if b < 0x20:
+                break
+        lng += ~(result >> 1) if (result & 1) else (result >> 1)
+        coords.append((lat / factor, lng / factor))
+    return coords
+
+
+def _encode_polyline(coords, precision: int = 5) -> str:
+    """Encode a list of (lat, lng) into a Google/OSRM polyline string."""
+    factor = 10 ** precision
+
+    def _enc(v: int) -> str:
+        v = (v << 1) if v >= 0 else ~(v << 1)
+        out = []
+        while v >= 0x20:
+            out.append((0x20 | (v & 0x1f)) + 63)
+            v >>= 5
+        out.append(v + 63)
+        return "".join(chr(c) for c in out)
+
+    res = []
+    plat = plng = 0
+    for lat, lng in coords:
+        ilat = round(lat * factor)
+        ilng = round(lng * factor)
+        res.append(_enc(ilat - plat))
+        res.append(_enc(ilng - plng))
+        plat, plng = ilat, ilng
+    return "".join(res)
+
+
+def _hav_km(a, b) -> float:
+    lat1, lon1 = _rad(a[0]), _rad(a[1])
+    lat2, lon2 = _rad(b[0]), _rad(b[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    h = _sin(dlat / 2) ** 2 + _cos(lat1) * _cos(lat2) * _sin(dlon / 2) ** 2
+    return 2 * 6371.0 * _asin(_sqrt(h))
+
+
+def _pt_seg_km(p, a, b) -> float:
+    """Distance (km) from point p to segment a-b, equirectangular approx."""
+    lat0 = _rad(a[0])
+    kx = 111.320 * _cos(lat0)
+    ky = 110.574
+    ax, ay = a[1] * kx, a[0] * ky
+    bx, by = b[1] * kx, b[0] * ky
+    px, py = p[1] * kx, p[0] * ky
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return _hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    cx, cy = ax + t * dx, ay + t * dy
+    return _hypot(px - cx, py - cy)
+
+
+def _crossings_on(coords, crossings, thresh_km: float = 0.03):
+    """Return the crossing tuples (lat,lng,id) that lie on the polyline."""
+    if not coords or len(coords) < 2 or not crossings:
+        return []
+    hit = []
+    for c in crossings:
+        cp = (c[0], c[1])
+        mind = min(_pt_seg_km(cp, coords[i], coords[i + 1]) for i in range(len(coords) - 1))
+        if mind <= thresh_km:
+            hit.append(c)
+    return hit
+
+
+async def _fetch_railway_features(client, bbox):
+    """Fetch railway level crossings + road bridges (flyovers/ROBs) inside a
+    bbox from Overpass. Cached per rounded bbox for _OVERPASS_TTL seconds.
+    Returns (crossings, bridges) where crossings=[(lat,lng,id)], bridges=[(lat,lng)].
+    Returns (None, None) if every Overpass mirror is unreachable."""
+    s, w, n, e = bbox
+    key = f"{s:.2f},{w:.2f},{n:.2f},{e:.2f}"
+    cached = _overpass_cache.get(key)
+    if cached and (_time.time() - cached["ts"]) < _OVERPASS_TTL:
+        return cached["crossings"], cached["bridges"]
+    headers = {"User-Agent": "FactoryERP-RouteOptimizer/1.0 (transport routing)"}
+    bb = f"{s},{w},{n},{e}"
+    # One combined query keeps us to a single request per mirror.
+    combined_q = (
+        f'[out:json][timeout:25];'
+        f'(node["railway"="level_crossing"]({bb});'
+        f'way["bridge"]["highway"]({bb}););out center;'
+    )
+    mirrors = [
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+    ]
+    for endpoint in mirrors:
+        try:
+            r = await client.get(endpoint, params={"data": combined_q}, headers=headers)
+            r.raise_for_status()
+            elements = r.json().get("elements", [])
+            crossings = []
+            bridges = []
+            for el in elements:
+                if el.get("type") == "node" and el.get("tags", {}).get("railway") == "level_crossing":
+                    if "lat" in el and "lon" in el:
+                        crossings.append((el["lat"], el["lon"], el.get("id")))
+                elif el.get("type") == "way":
+                    ctr = el.get("center") or {}
+                    if "lat" in ctr and "lon" in ctr:
+                        bridges.append((ctr["lat"], ctr["lon"]))
+            _overpass_cache[key] = {"ts": _time.time(), "crossings": crossings, "bridges": bridges}
+            return crossings, bridges
+        except Exception as ex:
+            logger.warning("Overpass mirror %s failed: %s", endpoint, ex)
+            continue
+    return None, None
+
+
+async def _osrm_geojson(client, pts):
+    """Real-road route for a fixed sequence of (lat,lng) points.
+    Returns (coords[(lat,lng)], dist_km, dur_min)."""
+    coordstr = ";".join(f"{lng},{lat}" for (lat, lng) in pts)
+    url = f"https://router.project-osrm.org/route/v1/driving/{coordstr}"
+    r = await client.get(url, params={"overview": "full", "geometries": "geojson"})
+    r.raise_for_status()
+    d = r.json()
+    if d.get("code") != "Ok" or not d.get("routes"):
+        raise RuntimeError("OSRM route failed")
+    rt = d["routes"][0]
+    coords = [(c[1], c[0]) for c in rt["geometry"]["coordinates"]]
+    return coords, (rt.get("distance") or 0) / 1000.0, (rt.get("duration") or 0) / 60.0
+
+
+def _nearby_bridges(hits, bridges, max_n: int = 3, radius_km: float = 1.2):
+    """Bridges within radius of any crossed phatak, nearest first, de-duplicated."""
+    scored = []
+    seen = set()
+    for h in hits:
+        hp = (h[0], h[1])
+        for bp in bridges:
+            dkm = _hav_km(hp, bp)
+            if dkm <= radius_km:
+                k = (round(bp[0], 5), round(bp[1], 5))
+                if k in seen:
+                    continue
+                seen.add(k)
+                scored.append((dkm, bp))
+    scored.sort(key=lambda x: x[0])
+    return [bp for _, bp in scored[:max_n]]
+
+
+async def _build_avoidance_route(client, ordered_pts, crossings, bridges, alt_budget: int = 12):
+    """Build a factory→stops route that minimises railway level crossings by
+    detouring via nearby road bridges/flyovers. Returns
+    (coords[(lat,lng)], dist_km, dur_min, hit_crossings)."""
+    full = []
+    tot_d = tot_t = 0.0
+    all_hits = []
+    used = 0
+    for i in range(len(ordered_pts) - 1):
+        A, B = ordered_pts[i], ordered_pts[i + 1]
+        base_coords, bd, bt = await _osrm_geojson(client, [A, B])
+        base_hits = _crossings_on(base_coords, crossings)
+        best = (base_coords, bd, bt, base_hits)
+        if base_hits and bridges and used < alt_budget:
+            for bp in _nearby_bridges(base_hits, bridges):
+                if used >= alt_budget:
+                    break
+                used += 1
+                try:
+                    ac, ad, at = await _osrm_geojson(client, [A, bp, B])
+                except Exception:
+                    continue
+                if ad > bd * 2.8:
+                    continue
+                ah = _crossings_on(ac, crossings)
+                if len(ah) < len(best[3]):
+                    best = (ac, ad, at, ah)
+                    if not ah:
+                        break
+        bc, bd2, bt2, bh = best
+        if full and bc:
+            full.extend(bc[1:])
+        else:
+            full.extend(bc)
+        tot_d += bd2
+        tot_t += bt2
+        all_hits.extend(bh)
+    uniq = {}
+    for c in all_hits:
+        uniq[c[2]] = c
+    return full, round(tot_d, 2), round(tot_t, 1), list(uniq.values())
+
+
+
 @api_router.post("/transport/optimize")
 async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
     """Compute MULTIPLE candidate factory→stops routes so the operator can
@@ -8152,6 +8375,43 @@ async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
 
     # Sort options shortest-first so the best is on top / default.
     options.sort(key=lambda o: (o.get("total_distance_km") is None, o.get("total_distance_km") or 1e9))
+
+    # ── "Avoid railway crossing" option (prefers flyovers / road bridges) ──
+    # Best-effort: relies on OpenStreetMap level-crossing + bridge data via
+    # Overpass. Non-fatal — if Overpass is unreachable we skip this option and
+    # leave the standard options untouched.
+    try:
+        all_lls = [factory_ll] + pts
+        lats_ = [p[0] for p in all_lls]
+        lngs_ = [p[1] for p in all_lls]
+        pad = 0.03
+        bbox = (min(lats_) - pad, min(lngs_) - pad, max(lats_) + pad, max(lngs_) + pad)
+        async with _httpx.AsyncClient(timeout=30) as oc:
+            crossings, bridges = await _fetch_railway_features(oc, bbox)
+            if crossings is not None:
+                # Annotate every existing option with how many phataks it crosses.
+                for o in options:
+                    oc_coords = _decode_polyline(o.get("geometry") or "")
+                    o["crossings"] = len(_crossings_on(oc_coords, crossings)) if oc_coords else None
+                # Build the avoidance route over the current best (shortest) order.
+                best_order = options[0]["order"]
+                ordered_pts = [factory_ll] + [pts[i] for i in best_order]
+                av_coords, av_d, av_t, av_hits = await _build_avoidance_route(
+                    oc, ordered_pts, crossings, bridges
+                )
+                if av_coords:
+                    options.append({
+                        "label": "Avoid railway crossing",
+                        "engine": "osrm+overpass",
+                        "order": best_order,
+                        "total_distance_km": av_d,
+                        "total_duration_min": av_t,
+                        "geometry": _encode_polyline(av_coords),
+                        "crossings": len(av_hits),
+                    })
+    except Exception as ex:
+        logger.warning("Avoid-railway-crossing option failed: %s", ex)
+
     best = options[0]
     return {
         "ok": True,

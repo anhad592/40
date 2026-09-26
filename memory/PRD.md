@@ -24,9 +24,11 @@ Full-stack Factory Order Management ERP (React + FastAPI + MongoDB): user roles,
 - Past custom work (may or may not survive repo replacements): OTP toggle, JK1 blank-view user, order/dispatch edit fixes, pvt-marka/bill-number exclusivity, leaflet maps (repo 38)
 
 ## Known Issues / Pending
-- RESOLVED (2026-09-26): admin password was reset to `admin123`, otp_login=false, login verified (dashboard loads with live data)
+- RESOLVED (2026-09-26): admin password reset to `admin123` — later REVERTED by the user themselves via Settings → Backup & Restore (5 restore calls in backend log). Current admin password = whatever is in the user's restored backup (user logs in fine with OTP). Do NOT reset again unless asked.
+- DONE (2026-09-26): agentic edit — TransportRoutes "Route summary + save" block moved below the map (was inside Select-transports panel). Compiled clean; visual check not possible (no valid creds after user's restore).
 - "Customer not found" when typing bill number in Daily Report pvt-marka field (reported pre-repo-38; recheck in repo 39 if user reports again)
 - `/api/health` 404 (route ordering bug in user's repo; root `/health` fine)
+- NOTE: TransportRoutes is not a route in App.js — it's embedded as a tab inside DailyReport (`/reports/daily`, tab value "transport")
 
 ## Next Action Items
 - Test repo 39 flows when user requests (user declined testing for the sync)

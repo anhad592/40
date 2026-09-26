@@ -751,83 +751,6 @@ export default function TransportRoutes() {
             </>
           )}
 
-          {/* Route summary + save */}
-          <div className="mt-3 border-t border-slate-100 pt-3 flex flex-wrap items-center gap-2">
-            <div className="text-[11px] font-bold text-slate-700 flex items-center gap-1.5" data-testid="tr-summary">
-              <Truck className="w-4 h-4 text-slate-500" />
-              {selectedTransports.length === 0 ? (
-                <span className="text-slate-400">Pick transports to auto-generate the shortest route</span>
-              ) : busy.optimizing ? (
-                <span className="inline-flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Optimising route…</span>
-              ) : result ? (
-                <>
-                  <span>{selectedTransports.length} stop{selectedTransports.length > 1 ? "s" : ""}</span>
-                  <span className="text-slate-300">·</span>
-                  <span className="text-[#E65100] font-mono-num">{result.total_distance_km} km</span>
-                  {result.total_duration_min ? (
-                    <>
-                      <span className="text-slate-300">·</span>
-                      <span className="font-mono-num">~{Math.round(result.total_duration_min)} min</span>
-                    </>
-                  ) : null}
-                  <span className="text-slate-400 text-[10px]">({result.engine})</span>
-                </>
-              ) : null}
-            </div>
-            {/* Alternative route options — pick a different route */}
-            {result?.options && result.options.length > 1 && (
-              <div className="w-full flex flex-wrap items-center gap-1.5" data-testid="tr-route-options">
-                <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mr-0.5">
-                  Route options:
-                </span>
-                {result.options.map((opt, i) => {
-                  const activeLabel = result._activeLabel || result.options[0].label;
-                  const active = opt.label === activeLabel;
-                  return (
-                    <button
-                      key={`${opt.label}-${i}`}
-                      type="button"
-                      onClick={() => selectRouteOption(opt)}
-                      data-testid={`tr-route-option-${i}`}
-                      className={`inline-flex items-center gap-1.5 h-8 px-2.5 rounded-sm border text-[11px] font-bold transition-colors ${
-                        active
-                          ? "bg-[#E65100] text-white border-[#E65100]"
-                          : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
-                      }`}
-                    >
-                      <RouteIcon className="w-3.5 h-3.5" />
-                      <span>{opt.label}</span>
-                      {opt.total_distance_km != null && (
-                        <span className={`font-mono-num ${active ? "text-white/90" : "text-[#E65100]"}`}>
-                          {opt.total_distance_km} km
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-            <div className="flex-1 min-w-[160px]">
-              <Input
-                value={routeName}
-                onChange={(e) => setRouteName(e.target.value)}
-                placeholder="Name this route (to save)"
-                className="h-9 rounded-sm"
-                data-testid="tr-route-name"
-              />
-            </div>
-            <Button
-              onClick={saveRoute}
-              disabled={busy.saving || selectedTransports.length === 0 || !routeName.trim()}
-              variant="outline"
-              className="h-9 rounded-sm border-slate-300"
-              data-testid="tr-save"
-            >
-              {busy.saving ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Save className="w-4 h-4 mr-1.5" />}
-              Save route
-            </Button>
-          </div>
-
           {/* Google Maps deep link for the current selection */}
           {orderedStops.length > 0 && (
             <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-2">
@@ -1124,6 +1047,83 @@ export default function TransportRoutes() {
             <FitBounds points={mapPoints} />
           </MapContainer>
         </div>
+      </div>
+
+      {/* Route summary + save — shown below the map */}
+      <div className="bg-white border border-slate-200 rounded-sm p-4 flex flex-wrap items-center gap-2">
+        <div className="text-[11px] font-bold text-slate-700 flex items-center gap-1.5" data-testid="tr-summary">
+          <Truck className="w-4 h-4 text-slate-500" />
+          {selectedTransports.length === 0 ? (
+            <span className="text-slate-400">Pick transports to auto-generate the shortest route</span>
+          ) : busy.optimizing ? (
+            <span className="inline-flex items-center gap-1"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Optimising route…</span>
+          ) : result ? (
+            <>
+              <span>{selectedTransports.length} stop{selectedTransports.length > 1 ? "s" : ""}</span>
+              <span className="text-slate-300">·</span>
+              <span className="text-[#E65100] font-mono-num">{result.total_distance_km} km</span>
+              {result.total_duration_min ? (
+                <>
+                  <span className="text-slate-300">·</span>
+                  <span className="font-mono-num">~{Math.round(result.total_duration_min)} min</span>
+                </>
+              ) : null}
+              <span className="text-slate-400 text-[10px]">({result.engine})</span>
+            </>
+          ) : null}
+        </div>
+        {/* Alternative route options — pick a different route */}
+        {result?.options && result.options.length > 1 && (
+          <div className="w-full flex flex-wrap items-center gap-1.5" data-testid="tr-route-options">
+            <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mr-0.5">
+              Route options:
+            </span>
+            {result.options.map((opt, i) => {
+              const activeLabel = result._activeLabel || result.options[0].label;
+              const active = opt.label === activeLabel;
+              return (
+                <button
+                  key={`${opt.label}-${i}`}
+                  type="button"
+                  onClick={() => selectRouteOption(opt)}
+                  data-testid={`tr-route-option-${i}`}
+                  className={`inline-flex items-center gap-1.5 h-8 px-2.5 rounded-sm border text-[11px] font-bold transition-colors ${
+                    active
+                      ? "bg-[#E65100] text-white border-[#E65100]"
+                      : "bg-white text-slate-700 border-slate-300 hover:bg-slate-50"
+                  }`}
+                >
+                  <RouteIcon className="w-3.5 h-3.5" />
+                  <span>{opt.label}</span>
+                  {opt.total_distance_km != null && (
+                    <span className={`font-mono-num ${active ? "text-white/90" : "text-[#E65100]"}`}>
+                      {opt.total_distance_km} km
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <div className="flex-1 min-w-[160px]">
+          <Input
+            value={routeName}
+            onChange={(e) => setRouteName(e.target.value)}
+            placeholder="Name this route (to save)"
+            className="h-9 rounded-sm"
+            data-testid="tr-route-name"
+          />
+        </div>
+        <Button
+          onClick={saveRoute}
+          disabled={busy.saving || selectedTransports.length === 0 || !routeName.trim()}
+          variant="outline"
+          className="h-9 rounded-sm border-slate-300"
+          data-testid="tr-save"
+        >
+          {busy.saving ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Save className="w-4 h-4 mr-1.5" />}
+          Save route
+        </Button>
       </div>
 
       {/* Saved routes */}

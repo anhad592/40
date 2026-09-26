@@ -751,42 +751,6 @@ export default function TransportRoutes() {
             </>
           )}
 
-          {/* Google Maps deep link for the current selection */}
-          {orderedStops.length > 0 && (
-            <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-2">
-              <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500">
-                Navigate on phone:
-              </span>
-              <a
-                href={buildGoogleMapsUrl(factory, orderedStops)}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-sm bg-[#1a73e8] hover:bg-[#155ab5] text-white text-[11px] font-bold uppercase tracking-wider"
-                data-testid="tr-open-gmaps"
-              >
-                <Navigation className="w-3.5 h-3.5" /> Open in Google Maps
-                <ExternalLink className="w-3 h-3 opacity-70" />
-              </a>
-              <button
-                type="button"
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(buildGoogleMapsUrl(factory, orderedStops));
-                    toast.success("Link copied — paste it in WhatsApp or SMS.");
-                  } catch (e) {
-                    toast.error("Copy failed. Long-press the Open button to copy the link.");
-                  }
-                }}
-                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-sm border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 text-[11px] font-bold uppercase tracking-wider"
-                data-testid="tr-copy-gmaps"
-              >
-                <Copy className="w-3.5 h-3.5" /> Copy link
-              </button>
-              <span className="text-[10px] text-slate-400">
-                Opens the Google Maps app on mobile, web on desktop.
-              </span>
-            </div>
-          )}
         </div>
       </div>
 
@@ -1124,6 +1088,43 @@ export default function TransportRoutes() {
           {busy.saving ? <Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> : <Save className="w-4 h-4 mr-1.5" />}
           Save route
         </Button>
+
+        {/* Google Maps deep link for the current selection */}
+        {orderedStops.length > 0 && (
+          <div className="w-full mt-2 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-2">
+            <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500">
+              Navigate on phone:
+            </span>
+            <a
+              href={buildGoogleMapsUrl(factory, orderedStops)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-sm bg-[#1a73e8] hover:bg-[#155ab5] text-white text-[11px] font-bold uppercase tracking-wider"
+              data-testid="tr-open-gmaps"
+            >
+              <Navigation className="w-3.5 h-3.5" /> Open in Google Maps
+              <ExternalLink className="w-3 h-3 opacity-70" />
+            </a>
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(buildGoogleMapsUrl(factory, orderedStops));
+                  toast.success("Link copied — paste it in WhatsApp or SMS.");
+                } catch (e) {
+                  toast.error("Copy failed. Long-press the Open button to copy the link.");
+                }
+              }}
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-sm border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 text-[11px] font-bold uppercase tracking-wider"
+              data-testid="tr-copy-gmaps"
+            >
+              <Copy className="w-3.5 h-3.5" /> Copy link
+            </button>
+            <span className="text-[10px] text-slate-400">
+              Opens the Google Maps app on mobile, web on desktop.
+            </span>
+          </div>
+        )}
       </div>
 
       {/* Saved routes */}

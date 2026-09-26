@@ -24,10 +24,11 @@ Full-stack Factory Order Management ERP (React + FastAPI + MongoDB): user roles,
 - Past custom work (may or may not survive repo replacements): OTP toggle, JK1 blank-view user, order/dispatch edit fixes, pvt-marka/bill-number exclusivity, leaflet maps (repo 38)
 
 ## Known Issues / Pending
-- Admin DB password no longer matches `admin123` (changed previously in-app; DB untouched by syncs). User may know current password; offer reset if they can't log in.
+- RESOLVED (2026-09-26): admin password was reset to `admin123`, otp_login=false, login verified (dashboard loads with live data)
 - "Customer not found" when typing bill number in Daily Report pvt-marka field (reported pre-repo-38; recheck in repo 39 if user reports again)
 - `/api/health` 404 (route ordering bug in user's repo; root `/health` fine)
 
 ## Next Action Items
-- Confirm user can log in with their current password; reset to admin123 if requested
-- Test repo 39 flows when user requests (user declined testing for this sync)
+- Test repo 39 flows when user requests (user declined testing for the sync)
+- Optional: brand the Facebook-style login page with JK Products identity
+- Optional: fix `/api/health` route ordering (one line move)

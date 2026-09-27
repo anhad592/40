@@ -8151,23 +8151,22 @@ async def _fetch_railway_features(client, bbox):
         f');out geom;'
     )
     mirrors = [
-        "https://overpass-api.de/api/interpreter",
         "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass-api.de/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
         "https://overpass.nchc.org.tw/api/interpreter",
         "https://overpass.private.coffee/api/interpreter",
+        "https://overpass.osm.ch/api/interpreter",
     ]
     elements = None
     for endpoint in mirrors:
-        for _attempt in range(2):
-            try:
-                r = await client.get(endpoint, params={"data": combined_q}, headers=headers)
-                r.raise_for_status()
-                elements = r.json().get("elements", [])
-                break
-            except Exception as ex:
-                logger.warning("Overpass mirror %s failed: %s", endpoint, ex)
-        if elements is not None:
+        try:
+            r = await client.get(endpoint, params={"data": combined_q}, headers=headers, timeout=12)
+            r.raise_for_status()
+            elements = r.json().get("elements", [])
             break
+        except Exception as ex:
+            logger.warning("Overpass mirror %s failed: %s", endpoint, ex)
     if elements is None:
         return None, None
 
@@ -8255,47 +8254,94 @@ def _nearby_flyover_apexes(hits, flyovers, max_n: int = 6, radius_km: float = 1.
     return picked
 
 
+def _order_along_route(full, ordered_pts, near_km: float = 0.15):
+    """Visit order of stops (positions 1..n-1 into ordered_pts; 0 is the
+    factory) by where each stop is first REACHED along the route geometry.
+
+    "Reached" = the route comes within `near_km` of the stop (a flyover detour
+    can physically pass a later stop before the nominal first one). Falls back
+    to the nearest-geometry-point index for stops the route never comes near.
+    This makes the on-map stop numbering match the real driving order."""
+    n = len(ordered_pts)
+    if n <= 2 and len(full) < 2:
+        return list(range(1, n))
+    if n <= 1:
+        return []
+
+    def first_reach_idx(p):
+        for i, c in enumerate(full):
+            if _hav_km(p, c) <= near_km:
+                return i
+        # never came near: use the closest point on the route
+        best_i, best_d = 0, 1e9
+        for i, c in enumerate(full):
+            d = _hav_km(p, c)
+            if d < best_d:
+                best_d, best_i = d, i
+        return best_i
+
+    pos = [(first_reach_idx(ordered_pts[i]), i) for i in range(1, n)]
+    pos.sort(key=lambda x: x[0])  # stable: ties keep the original order
+    return [i for _, i in pos]
+
+
 async def _build_avoidance_route(client, ordered_pts, crossings, flyovers, alt_budget: int = 24):
     """Build a factory→stops route that minimises railway level crossings by
     detouring via the apex of nearby flyovers (road bridges over the tracks).
-    Returns (coords[(lat,lng)], dist_km, dur_min, hit_crossings)."""
-    full = []
-    tot_d = tot_t = 0.0
-    all_hits = []
+    Returns (coords[(lat,lng)], dist_km, dur_min, hit_crossings, positions)
+    where positions is the visit order (indices into ordered_pts, 1-based;
+    0 is the factory) as they are actually reached along the final route."""
     used = 0
-    for i in range(len(ordered_pts) - 1):
-        A, B = ordered_pts[i], ordered_pts[i + 1]
-        base_coords, bd, bt = await _osrm_geojson(client, [A, B])
-        base_hits = _crossings_on(base_coords, crossings, flyovers)
-        best = (base_coords, bd, bt, base_hits)
-        if base_hits and flyovers and used < alt_budget:
-            for ap in _nearby_flyover_apexes(base_hits, flyovers):
-                if used >= alt_budget:
-                    break
-                used += 1
-                try:
-                    ac, ad, at = await _osrm_geojson(client, [A, ap, B])
-                except Exception:
-                    continue
-                if ad > bd * 2.8:
-                    continue
-                ah = _crossings_on(ac, crossings, flyovers)
-                if len(ah) < len(best[3]):
-                    best = (ac, ad, at, ah)
-                    if not ah:
+
+    async def _route_with_order(positions):
+        nonlocal used
+        seq = [ordered_pts[0]] + [ordered_pts[p] for p in positions]
+        full = []
+        tot_d = tot_t = 0.0
+        all_hits = []
+        for i in range(len(seq) - 1):
+            A, B = seq[i], seq[i + 1]
+            base_coords, bd, bt = await _osrm_geojson(client, [A, B])
+            base_hits = _crossings_on(base_coords, crossings, flyovers)
+            best = (base_coords, bd, bt, base_hits)
+            if base_hits and flyovers and used < alt_budget:
+                for ap in _nearby_flyover_apexes(base_hits, flyovers):
+                    if used >= alt_budget:
                         break
-        bc, bd2, bt2, bh = best
-        if full and bc:
-            full.extend(bc[1:])
-        else:
-            full.extend(bc)
-        tot_d += bd2
-        tot_t += bt2
-        all_hits.extend(bh)
-    uniq = {}
-    for c in all_hits:
-        uniq[c[2]] = c
-    return full, round(tot_d, 2), round(tot_t, 1), list(uniq.values())
+                    used += 1
+                    try:
+                        ac, ad, at = await _osrm_geojson(client, [A, ap, B])
+                    except Exception:
+                        continue
+                    if ad > bd * 2.8:
+                        continue
+                    ah = _crossings_on(ac, crossings, flyovers)
+                    if len(ah) < len(best[3]):
+                        best = (ac, ad, at, ah)
+                        if not ah:
+                            break
+            bc, bd2, bt2, bh = best
+            if full and bc:
+                full.extend(bc[1:])
+            else:
+                full.extend(bc)
+            tot_d += bd2
+            tot_t += bt2
+            all_hits.extend(bh)
+        uniq = {}
+        for c in all_hits:
+            uniq[c[2]] = c
+        return full, tot_d, tot_t, list(uniq.values())
+
+    positions = list(range(1, len(ordered_pts)))
+    full, tot_d, tot_t, hits = await _route_with_order(positions)
+    # If the detoured road physically reaches the stops in a different order,
+    # rebuild the legs in that real order so stop #1 is the first one reached.
+    real_pos = _order_along_route(full, ordered_pts)
+    if real_pos != positions:
+        full, tot_d, tot_t, hits = await _route_with_order(real_pos)
+        positions = real_pos
+    return full, round(tot_d, 2), round(tot_t, 1), hits, positions
 
 
 
@@ -8465,14 +8511,19 @@ async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
                 # Build the avoidance route over the current best (shortest) order.
                 best_order = options[0]["order"]
                 ordered_pts = [factory_ll] + [pts[i] for i in best_order]
-                av_coords, av_d, av_t, av_hits = await _build_avoidance_route(
+                av_coords, av_d, av_t, av_hits, av_positions = await _build_avoidance_route(
                     oc, ordered_pts, crossings, flyovers
                 )
                 if av_coords:
+                    # av_positions are 1-based indices into ordered_pts (0 =
+                    # factory) in the order the road actually reaches them —
+                    # map back to original stop indices so stop #1 on this
+                    # option is the first stop the flyover route reaches.
+                    av_order = [best_order[p - 1] for p in av_positions]
                     options.append({
                         "label": "Avoid railway crossing",
                         "engine": "osrm+overpass",
-                        "order": best_order,
+                        "order": av_order,
                         "total_distance_km": av_d,
                         "total_duration_min": av_t,
                         "geometry": _encode_polyline(av_coords),

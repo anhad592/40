@@ -25,6 +25,8 @@ Full-stack Factory Order Management ERP (React + FastAPI + MongoDB): user roles,
 
 ## Known Issues / Pending
 - RESOLVED (2026-09-26): admin password reset to `admin123` — later REVERTED by the user themselves via Settings → Backup & Restore (5 restore calls in backend log). Current admin password = whatever is in the user's restored backup (user logs in fine with OTP). Do NOT reset again unless asked.
+- RESOLVED (2026-09-27): OTP emails were never sent — Gmail rejected the saved app password (535 BadCredentials). Admin account email changed admin@factory.com → ganpatifillingstn@gmail.com; NEW Gmail app password set in `/app/backend/.env` (GMAIL_APP_PASSWORD) + DB `app_backup_settings.gmail_app_password`. SMTP verified, test email delivered. OTP recipient = backup settings `send_to` (already ganpatifillingstn@gmail.com), NOT the account email.
+- CAUTION: a backup restore of `app_backup_settings` would revert the Gmail password — if OTP stops arriving after a restore, re-check that collection.
 - DONE (2026-09-26): agentic edit — TransportRoutes "Route summary + save" block moved below the map (was inside Select-transports panel). Compiled clean; visual check not possible (no valid creds after user's restore).
 - "Customer not found" when typing bill number in Daily Report pvt-marka field (reported pre-repo-38; recheck in repo 39 if user reports again)
 - `/api/health` 404 (route ordering bug in user's repo; root `/health` fine)

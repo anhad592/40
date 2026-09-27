@@ -110,6 +110,14 @@ const factoryIcon = L.divIcon({
   iconAnchor: [17, 17],
 });
 
+// User-marked railway phatak — red crossbuck disc (the railway-crossing sign).
+const phatakIcon = L.divIcon({
+  className: "",
+  html: `<div style="background:#b91c1c;color:white;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 1px 5px rgba(0,0,0,.45);border:2px solid white;font-weight:900;font-size:13px;line-height:1">✕</div>`,
+  iconSize: [22, 22],
+  iconAnchor: [11, 11],
+});
+
 // Decode a Google-style encoded polyline (OSRM's default format).
 function decodePolyline(str, precision = 5) {
   if (!str) return [];
@@ -209,6 +217,8 @@ export default function TransportRoutes() {
   const [editingId, setEditingId] = useState(null);
   const [editingDraft, setEditingDraft] = useState({ ...emptyDraft });
   const [pickMode, setPickMode] = useState(false);
+  const [phataks, setPhataks] = useState([]);            // user-marked railway crossings
+  const [phatakMode, setPhatakMode] = useState(false);
   const [busy, setBusy] = useState({ adding: false, optimizing: false, saving: false });
   const [result, setResult] = useState(null);            // {order, total_distance_km, total_duration_min, geometry, engine}
   const [mapStyle, setMapStyle] = useState("map");
@@ -351,14 +361,16 @@ export default function TransportRoutes() {
 
   const loadAll = async () => {
     try {
-      const [fac, tr, sv] = await Promise.all([
+      const [fac, tr, sv, ph] = await Promise.all([
         api.get("/transport/factory"),
         api.get("/transports"),
         api.get("/transport/routes"),
+        api.get("/rail-crossings"),
       ]);
       if (fac?.data) setFactory(fac.data);
       setTransports(tr.data || []);
       setRoutes(sv.data || []);
+      setPhataks(ph.data || []);
     } catch (e) {
       // Silent — page loads even if one call fails.
     }
@@ -410,6 +422,29 @@ export default function TransportRoutes() {
     const la = Number(lat), lo = Number(lng);
     return Number.isFinite(la) && Number.isFinite(lo)
       && la >= -90 && la <= 90 && lo >= -180 && lo <= 180;
+  };
+
+  // Mark / remove a railway phatak. Marked phataks are always avoided by the
+  // "Avoid railway crossing" option — even if OpenStreetMap doesn't know them.
+  const addPhatak = async (lat, lng) => {
+    try {
+      const r = await api.post("/rail-crossings", { lat, lng });
+      setPhataks((prev) => [...prev, r.data]);
+      toast.success("Phatak marked. Avoid-route ab isse flyover se skip karega.");
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Could not mark phatak");
+    }
+  };
+
+  const deletePhatak = async (p) => {
+    if (!window.confirm("Delete this phatak marker?")) return;
+    try {
+      await api.delete(`/rail-crossings/${p.id}`);
+      setPhataks((prev) => prev.filter((x) => x.id !== p.id));
+      toast.success("Phatak removed.");
+    } catch (e) {
+      toast.error(e?.response?.data?.detail || "Delete failed");
+    }
   };
 
   const addTransport = async () => {
@@ -568,7 +603,7 @@ export default function TransportRoutes() {
             </div>
             <button
               type="button"
-              onClick={() => setPickMode((v) => !v)}
+              onClick={() => { setPickMode((v) => !v); setPhatakMode(false); }}
               className={`inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider px-2 py-1 rounded-sm border ${pickMode ? "bg-[#E65100] text-white border-[#E65100]" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"}`}
               data-testid="tr-pick-mode"
               title="Click anywhere on the map to drop a pin"
@@ -870,6 +905,15 @@ export default function TransportRoutes() {
           <span className="text-[10px] text-slate-400 font-mono-num">
             {factory.lat.toFixed(4)}, {factory.lng.toFixed(4)}
           </span>
+          <button
+            type="button"
+            onClick={() => { setPhatakMode((v) => !v); setPickMode(false); }}
+            className={`inline-flex items-center gap-1 text-[11px] font-bold uppercase tracking-wider px-2 py-1 rounded-sm border ${phatakMode ? "bg-[#b91c1c] text-white border-[#b91c1c]" : "bg-white text-[#b91c1c] border-red-200 hover:bg-red-50"}`}
+            data-testid="tr-phatak-mode"
+            title="Map par railway phatak par click karke mark karein — Avoid route usse flyover se skip karega"
+          >
+            <TrainFront className="w-3.5 h-3.5" /> {phatakMode ? "Click phatak on map…" : "Mark phatak"}
+          </button>
           <div className="ml-auto inline-flex rounded-sm border border-slate-200 overflow-hidden">
             <button
               type="button" onClick={() => setMapStyle("map")}
@@ -891,7 +935,7 @@ export default function TransportRoutes() {
           <MapContainer
             center={[factory.lat, factory.lng]}
             zoom={10}
-            style={{ height: "100%", width: "100%", cursor: pickMode ? "crosshair" : "" }}
+            style={{ height: "100%", width: "100%", cursor: pickMode || phatakMode ? "crosshair" : "" }}
             scrollWheelZoom
           >
             {mapStyle === "map" ? (
@@ -917,8 +961,12 @@ export default function TransportRoutes() {
               </>
             )}
             <ClickToPick
-              enabled={pickMode}
+              enabled={pickMode || phatakMode}
               onPick={({ lat, lng }) => {
+                if (phatakMode) {
+                  addPhatak(lat, lng);
+                  return;
+                }
                 setDraft((d) => ({ ...d, lat: lat.toFixed(6), lng: lng.toFixed(6) }));
                 setPickMode(false);
                 toast.success("Coordinates captured — give it a name and Add.");
@@ -928,6 +976,23 @@ export default function TransportRoutes() {
             <Marker position={[factory.lat, factory.lng]} icon={factoryIcon}>
               <Popup><b>Factory</b><br />{factory.label}</Popup>
             </Marker>
+
+            {/* User-marked railway phataks (red ✕) — always avoided by the
+                "Avoid railway crossing" option. Click a marker to delete it. */}
+            {phataks.map((p) => (
+              <Marker
+                key={`phatak-${p.id}`}
+                position={[p.lat, p.lng]}
+                icon={phatakIcon}
+                eventHandlers={{ click: () => deletePhatak(p) }}
+              >
+                <Popup>
+                  <b>{p.label || "Railway phatak"}</b><br />
+                  Avoid-route isse flyover se skip karta hai.<br />
+                  <span style={{ color: "#b91c1c" }}>Delete karne ke liye marker par click karein.</span>
+                </Popup>
+              </Marker>
+            ))}
 
             {/* Unselected transports: group co-located ones into a cluster pill
                 that says "N transports here" so overlap collapses into a single

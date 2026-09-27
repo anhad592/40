@@ -7911,6 +7911,46 @@ class OptimizeIn(BaseModel):
     stops: List[TransportStop]
 
 
+
+class RailCrossingIn(BaseModel):
+    lat: float
+    lng: float
+    label: Optional[str] = None
+
+
+# ── User-marked railway crossings (phataks) ───────────────────────────────
+# OpenStreetMap does not know every phatak, so operators can drop their own
+# markers on the map once; the route optimiser merges these with OSM data and
+# always avoids them (even when Overpass is unreachable).
+@api_router.get("/rail-crossings")
+async def list_rail_crossings(_user=Depends(get_current_user)):
+    return await db.rail_crossings.find({}, {"_id": 0}).to_list(500)
+
+
+@api_router.post("/rail-crossings")
+async def create_rail_crossing(body: RailCrossingIn, user=Depends(get_current_user)):
+    if not (-90 <= body.lat <= 90) or not (-180 <= body.lng <= 180):
+        raise HTTPException(status_code=400, detail="Coordinates are out of range")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "lat": float(body.lat),
+        "lng": float(body.lng),
+        "label": (body.label or "Phatak").strip() or "Phatak",
+        "created_at": now_iso(),
+        "created_by": user.get("email") or user.get("username") or user.get("id"),
+    }
+    await db.rail_crossings.insert_one(dict(doc))
+    return doc
+
+
+@api_router.delete("/rail-crossings/{cid}")
+async def delete_rail_crossing(cid: str, _user=Depends(get_current_user)):
+    res = await db.rail_crossings.delete_one({"id": cid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Rail crossing not found")
+    return {"ok": True}
+
+
 @api_router.get("/transport/factory")
 async def transport_factory(_user=Depends(get_current_user)):
     return FACTORY_LOCATION
@@ -8012,6 +8052,7 @@ async def transport_geocode(body: GeocodeIn, _user=Depends(get_current_user)):
 # "Avoid railway crossing" route that prefers flyovers / road-over-bridges).
 # ────────────────────────────────────────────────────────────────────────
 import time as _time
+import asyncio
 from math import radians as _rad, sin as _sin, cos as _cos, asin as _asin, sqrt as _sqrt, hypot as _hypot
 
 _overpass_cache: Dict[str, Any] = {}   # bbox-key -> {"ts", "crossings", "bridges"}
@@ -8127,20 +8168,65 @@ def _crossings_on(coords, crossings, flyovers=None, thresh_km: float = 0.03):
     return hit
 
 
-async def _fetch_railway_features(client, bbox):
-    """Fetch railway level crossings + rail-crossing road bridges (flyovers /
-    ROBs) inside a bbox from Overpass. Cached per rounded bbox.
+def _osm_map_api_fallback(bbox):
+    """Last-resort railway data via the main OSM map API (works when all
+    Overpass mirrors are down). Returns (elements_crossings, rail_pts,
+    bridge_geoms) or None on failure."""
+    import urllib.request
+    import gzip
+    import xml.etree.ElementTree as ET
+    s, w, n, e = bbox
+    # map API caps bbox area — shrink to the rail corridor if huge
+    if (n - s) * (e - w) > 0.04:
+        return None
+    url = f"https://api.openstreetmap.org/api/0.6/map?bbox={w},{s},{e},{n}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "FactoryERP-RouteOptimizer/1.0"})
+        raw = urllib.request.urlopen(req, timeout=60).read()
+        try:
+            data = gzip.decompress(raw)
+        except Exception:
+            data = raw
+        root = ET.fromstring(data)
+        nodes = {nd.get("id"): (float(nd.get("lat")), float(nd.get("lon")))
+                 for nd in root.findall("node")}
+        crossings = []
+        rail_pts = []
+        bridge_geoms = []
+        for nd in root.findall("node"):
+            tags = {t.get("k"): t.get("v") for t in nd.findall("tag")}
+            if tags.get("railway") == "level_crossing":
+                p = nodes.get(nd.get("id"))
+                if p:
+                    crossings.append((p[0], p[1], nd.get("id")))
+        for wy in root.findall("way"):
+            tags = {t.get("k"): t.get("v") for t in wy.findall("tag")}
+            geom = [nodes[r.get("ref")] for r in wy.findall("nd") if r.get("ref") in nodes]
+            if not geom:
+                continue
+            if tags.get("railway") == "rail":
+                rail_pts.extend(geom)
+            elif "bridge" in tags and "highway" in tags:
+                bridge_geoms.append(geom)
+        return crossings, rail_pts, bridge_geoms
+    except Exception as ex:
+        logger.warning("OSM map API fallback failed: %s", ex)
+        return None
 
-    Returns (crossings, flyovers) where crossings=[(lat,lng,id)] and
-    flyovers=[{"geom": [(lat,lng)...], "apex": (lat,lng)}] — apex is the
-    bridge geometry point closest to the rail line, i.e. the spot where the
-    flyover actually passes over the tracks. Returns (None, None) if every
-    Overpass mirror is unreachable."""
+
+async def _fetch_railway_features(client, bbox):
+    """Fetch railway level crossings + rail geometry + rail-crossing road
+    bridges (flyovers/ROBs) inside a bbox. Sources: Overpass mirrors first,
+    main OSM map API as fallback. Cached per rounded bbox.
+
+    Returns (crossings, flyovers, rail_pts) where
+    crossings=[(lat,lng,id)], flyovers=[{"geom", "apex"}], rail_pts=[(lat,lng)].
+    Returns (None, None, None) if every source is unreachable."""
     s, w, n, e = bbox
     key = f"{s:.2f},{w:.2f},{n:.2f},{e:.2f}"
     cached = _overpass_cache.get(key)
     if cached and (_time.time() - cached["ts"]) < _OVERPASS_TTL:
-        return cached["crossings"], cached["flyovers"]
+        return cached["crossings"], cached["flyovers"], cached.get("rail_pts", [])
     headers = {"User-Agent": "FactoryERP-RouteOptimizer/1.0 (transport routing)"}
     bb = f"{s},{w},{n},{e}"
     combined_q = (
@@ -8163,58 +8249,40 @@ async def _fetch_railway_features(client, bbox):
         try:
             r = await client.get(endpoint, params={"data": combined_q}, headers=headers, timeout=12)
             r.raise_for_status()
-            elements = r.json().get("elements", [])
-            break
+            els = r.json().get("elements", [])
+            if els:
+                elements = els
+                break
+            logger.warning("Overpass mirror %s returned 0 elements — trying next", endpoint)
         except Exception as ex:
             logger.warning("Overpass mirror %s failed: %s", endpoint, ex)
     if elements is None:
-        return None, None
+        # All Overpass mirrors down/empty — try the main OSM map API
+        # (different service, different rate limits) before giving up.
+        fb = await asyncio.to_thread(_osm_map_api_fallback, bbox)
+        if fb is None:
+            return None, None, None
+        crossings, rail_pts, bridge_geoms = fb
+    else:
+        crossings = []
+        rail_pts = []
+        bridge_geoms = []
+        for el in elements:
+            tags = el.get("tags", {})
+            if el.get("type") == "node" and tags.get("railway") == "level_crossing":
+                if "lat" in el and "lon" in el:
+                    crossings.append((el["lat"], el["lon"], el.get("id")))
+            elif el.get("type") == "way":
+                geom = [(g["lat"], g["lon"]) for g in el.get("geometry", [])]
+                if tags.get("railway") == "rail":
+                    rail_pts.extend(geom)
+                elif "bridge" in tags and "highway" in tags and geom:
+                    bridge_geoms.append(geom)
 
-    crossings = []
-    rail_pts = []
-    bridge_geoms = []
-    for el in elements:
-        tags = el.get("tags", {})
-        if el.get("type") == "node" and tags.get("railway") == "level_crossing":
-            if "lat" in el and "lon" in el:
-                crossings.append((el["lat"], el["lon"], el.get("id")))
-        elif el.get("type") == "way":
-            geom = [(g["lat"], g["lon"]) for g in el.get("geometry", [])]
-            if tags.get("railway") == "rail":
-                rail_pts.extend(geom)
-            elif "bridge" in tags and "highway" in tags and geom:
-                bridge_geoms.append(geom)
+    flyovers = _build_flyovers(bridge_geoms, rail_pts)
 
-    # Index rail points into ~1km cells so bridge↔rail proximity stays fast.
-    rail_grid: Dict[Any, list] = {}
-    for p in rail_pts:
-        rail_grid.setdefault((round(p[0], 2), round(p[1], 2)), []).append(p)
-
-    def _near_rail(pt, km=0.03):
-        cell = (round(pt[0], 2), round(pt[1], 2))
-        for dlat in (-0.01, 0.0, 0.01):
-            for dlng in (-0.01, 0.0, 0.01):
-                for rp in rail_grid.get((round(cell[0] + dlat, 2), round(cell[1] + dlng, 2)), []):
-                    if _hav_km(pt, rp) <= km:
-                        return rp
-        return None
-
-    # A flyover is a road bridge whose geometry actually crosses the rail line.
-    flyovers = []
-    for g in bridge_geoms:
-        best_d, best_bp, best_rp = 99.0, None, None
-        for bp in g:
-            rp = _near_rail(bp, 0.06)
-            if rp is None:
-                continue
-            d = _hav_km(bp, rp)
-            if d < best_d:
-                best_d, best_bp = d, bp
-        if best_bp is not None and best_d <= 0.03:
-            flyovers.append({"geom": g, "apex": best_bp})
-
-    _overpass_cache[key] = {"ts": _time.time(), "crossings": crossings, "flyovers": flyovers}
-    return crossings, flyovers
+    _overpass_cache[key] = {"ts": _time.time(), "crossings": crossings, "flyovers": flyovers, "rail_pts": rail_pts}
+    return crossings, flyovers, rail_pts
 
 
 async def _osrm_geojson(client, pts):
@@ -8285,9 +8353,107 @@ def _order_along_route(full, ordered_pts, near_km: float = 0.15):
     return [i for _, i in pos]
 
 
-async def _build_avoidance_route(client, ordered_pts, crossings, flyovers, alt_budget: int = 24):
+def _build_flyovers(bridge_geoms, rail_pts):
+    """A flyover is a road bridge whose geometry actually crosses the rail
+    line. Returns [{"geom", "apex"}] where apex is the bridge geometry point
+    closest to the tracks."""
+    rail_grid: Dict[Any, list] = {}
+    for p in rail_pts:
+        rail_grid.setdefault((round(p[0], 2), round(p[1], 2)), []).append(p)
+
+    def _near_rail(pt, km=0.06):
+        cell = (round(pt[0], 2), round(pt[1], 2))
+        for dlat in (-0.01, 0.0, 0.01):
+            for dlng in (-0.01, 0.0, 0.01):
+                for rp in rail_grid.get((round(cell[0] + dlat, 2), round(cell[1] + dlng, 2)), []):
+                    if _hav_km(pt, rp) <= km:
+                        return rp
+        return None
+
+    flyovers = []
+    for g in bridge_geoms:
+        best_d, best_bp = 99.0, None
+        for bp in g:
+            rp = _near_rail(bp)
+            if rp is None:
+                continue
+            d = _hav_km(bp, rp)
+            if d < best_d:
+                best_d, best_bp = d, bp
+        if best_bp is not None and best_d <= 0.03:
+            flyovers.append({"geom": g, "apex": best_bp})
+    return flyovers
+
+
+def _rail_side_points(hit, rail_pts, distances=(0.3, 0.7, 1.2), per_ring=2):
+    """Points ON the rail line at ~`distances` km from the phatak. A flyover
+    always crosses the rail somewhere, so a via point on the tracks at that
+    spot snaps OSRM onto the flyover road. Works without bridge data — only
+    needs the rail line geometry."""
+    out = []
+    for d in distances:
+        ring = [p for p in rail_pts if abs(_hav_km(hit, p) - d) <= 0.12]
+        picked = []
+        for p in ring:
+            if all(_hav_km(p, q) > 0.1 for q in picked):
+                picked.append(p)
+            if len(picked) >= per_ring:
+                break
+        out.extend(picked)
+    return out
+
+
+def _offset_via_points(hit, A, B, distances=(0.22, 0.45)):
+    """Via points on both sides of a crossed phatak, perpendicular to leg
+    A→B. OSRM snaps each to the nearest road — if a flyover or any
+    crossing-free road runs beside the phatak, the detoured route takes it.
+    Needs no bridge data, so avoidance works even with only user-marked
+    phataks and no Overpass."""
+    lat0 = _rad(hit[0])
+    kx = 111.320 * _cos(lat0)  # km per degree lng
+    ky = 110.574               # km per degree lat
+    ax, ay = A[1] * kx, A[0] * ky
+    bx, by = B[1] * kx, B[0] * ky
+    dx, dy = bx - ax, by - ay
+    L = _hypot(dx, dy) or 1.0
+    px, py = -dy / L, dx / L   # perpendicular unit vector
+    out = []
+    for d in distances:
+        for sgn in (1, -1):
+            out.append((hit[0] + sgn * d * py / ky, hit[1] + sgn * d * px / kx))
+    return out
+
+
+async def _rail_data_near(crossings, half: float = 0.012, max_tiles: int = 8):
+    """When big-bbox sources fail, fetch rail + bridge geometry in small
+    tiles around each known phatak via the main OSM map API (small bboxes
+    stay under the node limit even in dense city areas)."""
+    rail_pts: list = []
+    bridge_geoms: list = []
+    seen = set()
+    tiles = 0
+    for c in crossings:
+        key = (round(c[0], 2), round(c[1], 2))
+        if key in seen or tiles >= max_tiles:
+            continue
+        seen.add(key)
+        tiles += 1
+        fb = await asyncio.to_thread(
+            _osm_map_api_fallback,
+            (c[0] - half, c[1] - half, c[0] + half, c[1] + half),
+        )
+        if fb:
+            _, rp, bg = fb
+            rail_pts.extend(rp)
+            bridge_geoms.extend(bg)
+    return rail_pts, _build_flyovers(bridge_geoms, rail_pts)
+
+
+async def _build_avoidance_route(client, ordered_pts, crossings, flyovers, rail_pts=None, alt_budget: int = 30):
     """Build a factory→stops route that minimises railway level crossings by
-    detouring via the apex of nearby flyovers (road bridges over the tracks).
+    detouring via (a) the apex of nearby flyovers, (b) points on the rail line
+    beside the phatak (where a flyover would cross), or (c) perpendicular
+    side-road offsets.
     Returns (coords[(lat,lng)], dist_km, dur_min, hit_crossings, positions)
     where positions is the visit order (indices into ordered_pts, 1-based;
     0 is the factory) as they are actually reached along the final route."""
@@ -8304,8 +8470,23 @@ async def _build_avoidance_route(client, ordered_pts, crossings, flyovers, alt_b
             base_coords, bd, bt = await _osrm_geojson(client, [A, B])
             base_hits = _crossings_on(base_coords, crossings, flyovers)
             best = (base_coords, bd, bt, base_hits)
-            if base_hits and flyovers and used < alt_budget:
-                for ap in _nearby_flyover_apexes(base_hits, flyovers):
+            if base_hits and used < alt_budget:
+                # Candidates: flyover apexes near the hit (precise, needs OSM
+                # bridge data) + points on the rail line beside the phatak
+                # (flyover crossing points) + perpendicular side-road offsets.
+                cands = list(_nearby_flyover_apexes(base_hits, flyovers)) if flyovers else []
+                for h in base_hits:
+                    hp = (h[0], h[1])
+                    if rail_pts:
+                        cands.extend(_rail_side_points(hp, rail_pts))
+                    cands.extend(_offset_via_points(hp, A, B))
+                uniq_c = []
+                for cp in cands:
+                    if all(_hav_km(cp, u) > 0.05 for u in uniq_c):
+                        uniq_c.append(cp)
+                    if len(uniq_c) >= 10:
+                        break
+                for ap in uniq_c:
                     if used >= alt_budget:
                         break
                     used += 1
@@ -8492,18 +8673,32 @@ async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
     options.sort(key=lambda o: (o.get("total_distance_km") is None, o.get("total_distance_km") or 1e9))
 
     # ── "Avoid railway crossing" option (prefers flyovers / road bridges) ──
-    # Best-effort: relies on OpenStreetMap level-crossing + bridge data via
-    # Overpass. Non-fatal — if Overpass is unreachable we skip this option and
-    # leave the standard options untouched.
+    # Crossings come from OpenStreetMap (Overpass) PLUS phataks the operator
+    # marked on the map themselves — the user-marked ones always work, even
+    # when Overpass is unreachable or OSM doesn't know that phatak.
     try:
         all_lls = [factory_ll] + pts
         lats_ = [p[0] for p in all_lls]
         lngs_ = [p[1] for p in all_lls]
         pad = 0.03
         bbox = (min(lats_) - pad, min(lngs_) - pad, max(lats_) + pad, max(lngs_) + pad)
+        db_cross = await db.rail_crossings.find({}, {"_id": 0}).to_list(500)
+        user_cross = [(float(c["lat"]), float(c["lng"]), c.get("id") or "") for c in db_cross]
         async with _httpx.AsyncClient(timeout=30) as oc:
-            crossings, flyovers = await _fetch_railway_features(oc, bbox)
-            if crossings is not None:
+            crossings, flyovers, rail_pts = await _fetch_railway_features(oc, bbox)
+            if crossings is None:
+                crossings, flyovers, rail_pts = [], [], []
+            for uc in user_cross:
+                if not any(_hav_km((uc[0], uc[1]), (c[0], c[1])) <= 0.05 for c in crossings):
+                    crossings.append(uc)
+            if crossings and not rail_pts:
+                # Overpass/main-API gave nothing (rate limits, dense city
+                # bbox) — fetch small tiles around each known phatak instead.
+                try:
+                    rail_pts, flyovers = await _rail_data_near(crossings)
+                except Exception as ex2:
+                    logger.warning("Rail tile fetch failed: %s", ex2)
+            if crossings:
                 # Annotate every existing option with how many phataks it crosses.
                 for o in options:
                     oc_coords = _decode_polyline(o.get("geometry") or "")
@@ -8512,7 +8707,7 @@ async def transport_optimize(body: OptimizeIn, _user=Depends(get_current_user)):
                 best_order = options[0]["order"]
                 ordered_pts = [factory_ll] + [pts[i] for i in best_order]
                 av_coords, av_d, av_t, av_hits, av_positions = await _build_avoidance_route(
-                    oc, ordered_pts, crossings, flyovers
+                    oc, ordered_pts, crossings, flyovers, rail_pts
                 )
                 if av_coords:
                     # av_positions are 1-based indices into ordered_pts (0 =
